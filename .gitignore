@@ -1,1 +1,14 @@
+# Arquivos de log e banco
+*.log
+*.db
+logs/
+.env
 
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# IDEs e sistema
+.vscode/
+.DS_Store
