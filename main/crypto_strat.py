@@ -291,8 +291,15 @@ lower_buffer = round(n_contracts - buffer_width)
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
 
+def extract_position_size(p):
+    try:
+        return float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
+    except Exception as e:
+        logging.warning(f"Erro ao interpretar posição de {p.get('symbol', '?')}: {e}")
+        return 0.0
+
 actual_positions = pd.Series({
-    p['symbol']: float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
+    p['symbol']: extract_position_size(p)
     for p in actual_positions_dict
 })
 
