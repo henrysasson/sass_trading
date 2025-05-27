@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import time
 from datetime import datetime, timedelta
-import sqlite3
 import pysass_crypto as sass_crypto
 import logging
 
