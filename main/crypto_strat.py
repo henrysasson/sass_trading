@@ -5,22 +5,21 @@ import time
 from datetime import datetime, timedelta
 import pysass_crypto as sass_crypto
 import logging
+from sqlalchemy import create_engine
+import os
 
 start_time = time.time()
 
 ############################ CONFIGURAÇÕES #################################################################################
+############################ CONFIGURAÇÕES DE SEGURANÇA #######################################################
 exchange = ccxt.hyperliquid({
-    "walletAddress": "0x973A318a9984bA6B3C6965cBF86f27546FA91C88",
-    "privateKey": "0x615a7c174a1ad31ddb606b8a7229df1b8e5db786f5aba2bb52b7d9688f84d58e",
+    "walletAddress": os.environ['WALLET_ADDRESS'],
+    "privateKey": os.environ['PRIVATE_KEY'],
 })
 
-
-
-
 # Configuração do logger
-# Gera o nome do arquivo baseado na data atual
-log_filename = f"trading_log_{datetime.today().strftime('%Y-%m-%d')}.log"
-
+log_filename = f"logs/trading_log_{datetime.today().strftime('%Y-%m-%d')}.log"
+os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
     filename=log_filename,
     level=logging.INFO,
@@ -28,25 +27,23 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+# Conexão com o banco PostgreSQL (RDS)
+DB_USER = os.environ['DB_USER']
+DB_PASS = os.environ['DB_PASS']
+DB_HOST = os.environ['DB_HOST']
+DB_PORT = os.environ.get('DB_PORT', '5432')
+DB_NAME = os.environ['DB_NAME']
 
-
-# Connect to the SQLite database
-database = sqlite3.connect('crypto_data.db')
-cursor = database.cursor()
+engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 ###########################################################################################################
-# Subtrair 370 dias
-initial_date = (datetime.today() - timedelta(days=500)).strftime('%Y-%m-%d')
-
-# Montar a query com a data dinâmica
+# Subtrair 500 dias
+data_inicial = (datetime.today() - timedelta(days=500)).strftime('%Y-%m-%d')
 query = f"""
-    SELECT * 
-    FROM ohlcv 
-    WHERE date >= '{initial_date}'
+    SELECT * FROM ohlcv WHERE date >= '{data_inicial}'
 """
+data = pd.read_sql_query(query, engine)
 
-# Executar a query
-data = pd.read_sql_query(query, database)
 ###########################################################################################################
 
 volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']])
@@ -132,7 +129,6 @@ df['symbol'] = df['symbol'].str.replace('/USDC:USDC', '', regex=True).str.strip(
 ###################################### INSERIR OS DADOS DE PREÇOS NO BANCO ####################################
 
 df.to_sql('ohlcv', con=database, index=False, if_exists='append')
-
 
 # ajustar price para incluir dados recentes, sem precisar fazer uma nova consulta no banco
 price = pd.concat([price, sass_crypto.format_from_database(df[['date', 'symbol', 'close']])])
