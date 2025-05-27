@@ -443,7 +443,7 @@ updated_positions = exchange.fetchPositions()
 
 
 execute_orders_df = pd.DataFrame(execute_orders)
-execute_orders_df.to_sql('orders', con=database, ...)
+execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
 
 updated_positions_df = pd.DataFrame(updated_positions)
 updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
