@@ -54,17 +54,45 @@ volume = volume * price
 
 ###################################### PUXAR OS PREÇOS DA EXCHANGE ####################################
 
-symbols = price.columns
 
-symbols_hype = [s + '/USDC:USDC' for s in symbols]
+
+# Obtem a lista de símbolos disponíveis na Hyperliquid
+symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
+
+# Conecta ao banco e busca os últimos timestamps
+with sqlite3.connect("crypto_hype.db") as conn:
+    # Consulta para pegar o último timestamp por símbolo
+    latest_dates = pd.read_sql_query("""
+        SELECT symbol, MAX(date) as last_date
+        FROM ohlcv
+        GROUP BY symbol
+    """, conn)
+
+# Converte datas para datetime e calcula o 'since' em milissegundos
+latest_dates['last_date'] = pd.to_datetime(latest_dates['last_date'])
+latest_dates['since'] = (latest_dates['last_date'] + pd.Timedelta(minutes=15)).astype(np.int64) // 10**6
+
+# Cria o mapeamento symbol → since, ajustando o sufixo
+symbol_since_map = dict(zip(latest_dates['symbol'], latest_dates['since']))
 
 # Lista para armazenar os dados
 all_data = []
 
-# Loop sequencial para buscar 4 candles de 15 minutos
-for symbol in symbols_hype:
+# Loop apenas nos símbolos que já estão no banco
+symbols_in_db = [s for s in symbols_hype if s.replace('/USDC:USDC', '') in symbol_since_map]
+
+for symbol in symbols_in_db:
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m')
+        # Remove sufixo para buscar 'since' correto
+        databank_symbol = symbol.replace('/USDC:USDC', '')
+        since = symbol_since_map.get(databank_symbol)
+
+        if since is None:
+            continue  # Pula se não tiver timestamp de referência
+
+        # Busca os dados
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', since=since)
+
         for entry in ohlcv:
             all_data.append({
                 'date': pd.to_datetime(entry[0], unit='ms'),
@@ -75,6 +103,7 @@ for symbol in symbols_hype:
                 'close': entry[4],
                 'volume': entry[5],
             })
+
     except Exception as e:
         logging.error(f"Erro ao buscar dados de {symbol}: {e}", exc_info=True)
 
@@ -133,6 +162,7 @@ df.to_sql('ohlcv', con=database, index=False, if_exists='append')
 # ajustar price para incluir dados recentes, sem precisar fazer uma nova consulta no banco
 price = pd.concat([price, sass_crypto.format_from_database(df[['date', 'symbol', 'close']])])
 
+symbols = price.columns
 ##################### FILTRAR O UNIVERSO DE ATIVOS NEGOCIÁVEIS ##################################
 
 
