@@ -60,9 +60,8 @@ volume = volume * price
 symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
 
 # Conecta ao banco e busca os últimos timestamps
-with sqlite3.connect("crypto_hype.db") as conn:
-    # Consulta para pegar o último timestamp por símbolo
-    latest_dates = pd.read_sql_query("""
+with engine.connect() as conn:
+    latest_dates = pd.read_sql("""
         SELECT symbol, MAX(date) as last_date
         FROM ohlcv
         GROUP BY symbol
@@ -157,10 +156,14 @@ df['symbol'] = df['symbol'].str.replace('/USDC:USDC', '', regex=True).str.strip(
 
 ###################################### INSERIR OS DADOS DE PREÇOS NO BANCO ####################################
 
-df.to_sql('ohlcv', con=database, index=False, if_exists='append')
+df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
 # ajustar price para incluir dados recentes, sem precisar fazer uma nova consulta no banco
 price = pd.concat([price, sass_crypto.format_from_database(df[['date', 'symbol', 'close']])])
+price.index = pd.to_datetime(price.index)
+price = price[~price.index.duplicated(keep='last')]
+price = price.sort_index()
+
 
 symbols = price.columns
 ##################### FILTRAR O UNIVERSO DE ATIVOS NEGOCIÁVEIS ##################################
@@ -322,7 +325,7 @@ dollar_weights = (optimal_positions.abs() * last_price)
 
 dollar_weights = dollar_weights.reindex(percent_vol.index)
 
-cmatrix = returns_15min.corr(20*96).values
+cmatrix = returns_15min.iloc[-20*96:].corr().values
 
 sigma = np.diag(percent_vol.values).dot(cmatrix).dot(np.diag(percent_vol.values))
 
@@ -440,10 +443,10 @@ updated_positions = exchange.fetchPositions()
 
 
 execute_orders_df = pd.DataFrame(execute_orders)
-execute_orders_df.to_sql('orders', con=database, index=False, if_exists='append')
+execute_orders_df.to_sql('orders', con=database, ...)
 
 updated_positions_df = pd.DataFrame(updated_positions)
-updated_positions_df.to_sql('positions', con=database, index=False, if_exists='append')
+updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
 
 logging.info("Execução completa com sucesso.")
 logging.info(f"Tempo total de execução: {round(time.time() - start_time, 2)} segundos.")
