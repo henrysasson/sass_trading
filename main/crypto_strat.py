@@ -130,17 +130,13 @@ df = df.dropna(subset=['date'])
 df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
 # OTIMIZAÇÃO 5: Atualizar price de forma mais eficiente
-price_update = df.pivot_table(
-    index='date', columns='symbol', values='close', aggfunc='last'
-).astype('float32')
+price_update = df.pivot_table(index='date', columns='symbol', values='close', aggfunc='last', observed=False).astype('float32')
 
 price = price_update.combine_first(price).sort_index()
 price = price.loc[~price.index.duplicated(keep='last')]
 
 # Atualizar volume
-volume_update = df.pivot_table(
-    index='date', columns='symbol', values='volume', aggfunc='last'
-).astype('float32')
+volume_update = df.pivot_table(index='date', columns='symbol', values='volume', aggfunc='last', observed=False).astype('float32')
 volume_update = volume_update * price_update
 
 volume = volume_update.combine_first(volume).sort_index()
@@ -149,7 +145,7 @@ volume = volume.loc[~volume.index.duplicated(keep='last')]
 # Limpar dados temporários
 del df, price_update, volume_update
 gc.collect()
-log_memory_usage("após sanity check")
+# log_memory_usage("após sanity check")
 
 ##################### FILTRAR O UNIVERSO DE ATIVOS NEGOCIÁVEIS (OTIMIZADO) ##################################
 min_obs = 365 * 96
@@ -241,9 +237,13 @@ n_contracts = (capital * combined_forecast * idm * risk_weights * vol_target) / 
 
 buffer_width = (0.1 * capital * idm * risk_weights * vol_target) / (last_percent_vol * last_price)
 
-upper_buffer = round(n_contracts + buffer_width)
+upper_buffer = n_contracts + buffer_width
+lower_buffer = n_contracts - buffer_width
 
-lower_buffer = round(n_contracts - buffer_width)
+n_contracts.index = n_contracts.index.map(lambda x: f"{x}/USDC:USDC")
+upper_buffer.index = upper_buffer.index.map(lambda x: f"{x}/USDC:USDC")
+lower_buffer.index = lower_buffer.index.map(lambda x: f"{x}/USDC:USDC")
+
 
 
 # Posições atuais
@@ -256,14 +256,32 @@ actual_positions = pd.Series({
 
 
 # Posições ótimas
-optimal_positions = n_contracts.where(
-    (actual_positions < lower_buffer) | (actual_positions > upper_buffer),
-    actual_positions
+# Garantir alinhamento das Series
+
+
+
+relevant_symbols = n_contracts.index.union(actual_positions.index)
+
+actual_positions_aligned = actual_positions.reindex(relevant_symbols, fill_value=0)
+lower_buffer_aligned = lower_buffer.reindex(relevant_symbols, fill_value=0)
+upper_buffer_aligned = upper_buffer.reindex(relevant_symbols, fill_value=0)
+n_contracts_aligned = n_contracts.reindex(relevant_symbols, fill_value=0)
+
+
+# Calcular posições ótimas apenas onde rebalancear
+optimal_positions = n_contracts_aligned.where(
+    (actual_positions_aligned < lower_buffer_aligned) | (actual_positions_aligned > upper_buffer_aligned),
+    actual_positions_aligned
 )
+
+logging.info(f"Posições ótimas:\n{optimal_positions.to_string()}")
 
 ####################################### RISK OVERLAY (OTIMIZADO) ####################################################
 # Leverage
-leverage = (optimal_positions.abs() * last_price).sum()
+temp_optimal_positions = optimal_positions.copy()
+temp_optimal_positions.index = temp_optimal_positions.index.str.replace('/USDC:USDC', '', regex=False)
+
+leverage = (temp_optimal_positions.abs() * last_price).sum()
 max_risk_leverage = 2
 
 if leverage == 0:
@@ -272,7 +290,7 @@ else:
     leverage_risk_multiplier = min(1, max_risk_leverage / leverage)
 
 # Expected Risk (versão otimizada)
-dollar_weights = (optimal_positions.abs() * last_price)
+dollar_weights = (temp_optimal_positions.abs() * last_price)
 dollar_weights = dollar_weights.reindex(last_percent_vol.index, fill_value=0)
 
 # Usar apenas dados recentes para correlação (reduz uso de memória)
@@ -287,13 +305,15 @@ expected_risk_multiplier = min(1, 1.25/portfolio_std)
 
 # Risk Multiplier
 risk_overlay_multiplier = min(leverage_risk_multiplier, expected_risk_multiplier)
-optimal_positions = optimal_positions * risk_overlay_multiplier
+temp_optimal_positions = temp_optimal_positions * risk_overlay_multiplier
 
 logging.info(f"Risk overlay aplicado: leverage_multiplier={leverage_risk_multiplier:.4f}, expected_risk_multiplier={expected_risk_multiplier:.4f}, total={risk_overlay_multiplier:.4f}")
 
 # Limit Exposure
-limit_position = ((optimal_positions * last_price) / capital).clip(-0.2, 0.4)
-optimal_positions = (limit_position * capital) / last_price
+limit_position = ((temp_optimal_positions * last_price) / capital).clip(-0.2, 0.4)
+temp_optimal_positions = (limit_position * capital) / last_price
+
+optimal_positions.index = temp_optimal_positions.index.map(lambda x: f"{x}/USDC:USDC")
 
 # Log informativo das posições ótimas
 logging.info(f"Posições ótimas:\n{optimal_positions.to_string()}")
@@ -303,7 +323,7 @@ logging.info(f"Posições ótimas:\n{optimal_positions.to_string()}")
 
 # 1. Identifica ativos a zerar (presentes apenas em actual_positions)
 
-optimal_positions.index = optimal_positions.index.map(lambda x: f"{x}/USDC:USDC")
+# optimal_positions.index = optimal_positions.index.map(lambda x: f"{x}/USDC:USDC")
 
 
 symbols_to_close = actual_positions.index.difference(optimal_positions.index)
@@ -394,10 +414,10 @@ updated_positions = exchange.fetchPositions()
 
 
 execute_orders_df = pd.DataFrame(execute_orders)
-execute_orders_df.to_sql('orders', con=database, index=False, if_exists='append')
+execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
 
 updated_positions_df = pd.DataFrame(updated_positions)
-updated_positions_df.to_sql('positions', con=database, index=False, if_exists='append')
+updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
 
 logging.info("Execução completa com sucesso.")
 logging.info(f"Tempo total de execução: {round(time.time() - start_time, 2)} segundos.")
