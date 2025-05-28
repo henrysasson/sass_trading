@@ -465,7 +465,7 @@ for exchange_symbol, trade_size in trades_exchange.items():
         continue
     elif fin_value < 10:
         # Ajustar para valor mínimo
-        min_size = 10 / price
+        min_size = 11 / price
         adjusted_trades[exchange_symbol] = min_size * (1 if trade_size > 0 else -1)
     else:
         # Manter trade original
