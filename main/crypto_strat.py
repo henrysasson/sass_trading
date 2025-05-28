@@ -43,10 +43,10 @@ DB_NAME = os.environ['DB_NAME']
 engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 ###########################################################################################################
-# OTIMIZAÇÃO 1: Carregamento mais eficiente dos dados
+# CARREGAMENTO INICIAL: Símbolos já estão limpos no banco
 initial_date = (datetime.today() - timedelta(days=370)).strftime('%Y-%m-%d')
 
-# Carregar apenas colunas necessárias e com tipos otimizados
+# Carregar dados do banco (símbolos já em formato limpo)
 query = f"""
     SELECT date, symbol, close, volume 
     FROM ohlcv 
@@ -54,10 +54,9 @@ query = f"""
     ORDER BY date, symbol
 """
 
-# Carregar com tipos otimizados
 dtype_dict = {
-    'symbol': 'category',  # Reduz uso de memória para strings repetidas
-    'close': 'float32',    # float32 é suficiente para preços
+    'symbol': 'category',
+    'close': 'float32',
     'volume': 'float32'
 }
 
@@ -65,8 +64,7 @@ data = pd.read_sql_query(query, engine, dtype=dtype_dict)
 data['date'] = pd.to_datetime(data['date'])
 log_memory_usage("carregamento inicial")
 
-# OTIMIZAÇÃO 2: Processar price e volume de forma mais eficiente
-# Usar pivot_table diretamente é mais eficiente que a função customizada
+# Usar dados direto para cálculos (símbolos já limpos)
 price = data.pivot_table(index='date', columns='symbol', values='close', aggfunc='last', observed=True).astype('float32')
 volume_raw = data.pivot_table(index='date', columns='symbol', values='volume', aggfunc='last', observed=True).astype('float32')
 
@@ -102,9 +100,12 @@ for i in range(0, len(symbols_hype), batch_size):
                 ('low', 'f4'), ('close', 'f4'), ('volume', 'f4')
             ])
             
+            # CONVERTER SÍMBOLO PARA FORMATO LIMPO ANTES DE SALVAR NO BANCO
+            clean_symbol = symbol.replace('/USDC:USDC', '').replace('/USD:USD', '').replace('/USDT:USDT', '').strip()
+            
             df_chunk = pd.DataFrame({
                 'date': pd.to_datetime(ohlcv_array['timestamp'], unit='ms'),
-                'symbol': symbol,
+                'symbol': clean_symbol,  # ← Salvar formato limpo no banco
                 'open': ohlcv_array['open'],
                 'high': ohlcv_array['high'],
                 'low': ohlcv_array['low'],
@@ -191,11 +192,7 @@ def sanitize_dataframe_efficient(df, limit_change, last_price):
     
     return pd.concat(sanitized_chunks, ignore_index=True)
 
-# Aplicar sanity check otimizado
-df_sanitized = sanitize_dataframe_efficient(df, limit_change, last_price)
-df_sanitized['symbol'] = df_sanitized['symbol'].str.replace('/USDC:USDC', '', regex=False)
-
-# Inserir dados sanitizados
+# Inserir dados sanitizados (MANTER FORMATO ORIGINAL DOS SÍMBOLOS)
 df_sanitized.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
 # OTIMIZAÇÃO 5: Atualizar price de forma mais eficiente
@@ -310,27 +307,60 @@ lower_buffer = n_contracts - buffer_width
 
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
-actual_positions = pd.Series({
+actual_positions_raw = pd.Series({
     p['symbol']: float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
-    for p in actual_positions_dict
+    for p in actual_positions_dict if float(p['info']['position']['szi']) != 0  # Apenas posições não-zero
 }, dtype='float32')
 
-# Alinhar índices ANTES da comparação
-all_symbols = n_contracts.index.union(actual_positions.index)
-n_contracts_aligned = n_contracts.reindex(all_symbols, fill_value=0)
-actual_positions_aligned = actual_positions.reindex(all_symbols, fill_value=0)
-upper_buffer_aligned = upper_buffer.reindex(all_symbols, fill_value=0)
-lower_buffer_aligned = lower_buffer.reindex(all_symbols, fill_value=0)
+# CORREÇÃO ROBUSTA: Mapear símbolos da exchange para formato do banco
+def map_exchange_to_clean_symbol(exchange_symbol):
+    """Converte símbolo da exchange para formato limpo do banco"""
+    return exchange_symbol.replace('/USDC:USDC', '').replace('/USD:USD', '').replace('/USDT:USDT', '').strip()
 
-# Posições ótimas
+def map_clean_to_exchange_symbol(clean_symbol):
+    """Converte símbolo limpo para formato da exchange (padrão USDC)"""
+    return f"{clean_symbol}/USDC:USDC"
+
+# Converter posições atuais para formato limpo
+actual_positions_clean = pd.Series(dtype='float32')
+for symbol_exchange, position in actual_positions_raw.items():
+    symbol_clean = map_exchange_to_clean_symbol(symbol_exchange)
+    actual_positions_clean[symbol_clean] = position
+
+# Debug: verificar alinhamento de símbolos
+n_contracts_symbols = set(n_contracts.index)
+actual_positions_symbols = set(actual_positions_clean.index)
+common_symbols = n_contracts_symbols.intersection(actual_positions_symbols)
+only_in_calc = n_contracts_symbols - actual_positions_symbols
+only_in_positions = actual_positions_symbols - n_contracts_symbols
+
+logging.info(f"Símbolos em comum: {len(common_symbols)}")
+logging.info(f"Apenas em cálculos: {only_in_calc}")
+logging.info(f"Apenas em posições: {only_in_positions}")
+
+# Trabalhar apenas com símbolos que estão no universo de trading ou que têm posições
+relevant_symbols = n_contracts_symbols.union(actual_positions_symbols)
+
+# Alinhar todos os dados para símbolos relevantes
+n_contracts_aligned = n_contracts.reindex(relevant_symbols, fill_value=0)
+actual_positions_aligned = actual_positions_clean.reindex(relevant_symbols, fill_value=0)
+upper_buffer_aligned = upper_buffer.reindex(relevant_symbols, fill_value=0)
+lower_buffer_aligned = lower_buffer.reindex(relevant_symbols, fill_value=0)
+
+# Posições ótimas (apenas rebalancear onde necessário)
 optimal_positions = n_contracts_aligned.where(
     (actual_positions_aligned < lower_buffer_aligned) | (actual_positions_aligned > upper_buffer_aligned),
     actual_positions_aligned
 )
 
+# Zerar posições de símbolos que não fazem mais parte do universo de trading
+for symbol in only_in_positions:
+    if symbol not in n_contracts_symbols:
+        optimal_positions[symbol] = 0  # Forçar fechamento
+
 ####################################### RISK OVERLAY (OTIMIZADO) ####################################################
 # Leverage
-leverage = (optimal_positions.abs() * last_price.reindex(optimal_positions.index, fill_value=0)).sum()
+leverage = (optimal_positions.abs() * last_price).sum()
 max_risk_leverage = 2
 
 if leverage == 0:
@@ -339,16 +369,14 @@ else:
     leverage_risk_multiplier = min(1, max_risk_leverage / leverage)
 
 # Expected Risk (versão otimizada)
-dollar_weights = (optimal_positions.abs() * last_price.reindex(optimal_positions.index, fill_value=0))
+dollar_weights = (optimal_positions.abs() * last_price)
+dollar_weights = dollar_weights.reindex(last_percent_vol.index, fill_value=0)
 
 # Usar apenas dados recentes para correlação (reduz uso de memória)
 recent_returns = returns_15min.tail(20*96)
 cmatrix = recent_returns.corr().values
 
-# Alinhar percent_vol com optimal_positions
-last_percent_vol_aligned = last_percent_vol.reindex(optimal_positions.index, fill_value=0.01)
-
-sigma = np.outer(last_percent_vol_aligned.values, last_percent_vol_aligned.values) * cmatrix
+sigma = np.outer(last_percent_vol.values, last_percent_vol.values) * cmatrix
 portfolio_variance = dollar_weights.values.dot(sigma).dot(dollar_weights.values)
 portfolio_std = np.sqrt(portfolio_variance)
 
@@ -361,24 +389,36 @@ optimal_positions = optimal_positions * risk_overlay_multiplier
 logging.info(f"Risk overlay aplicado: leverage_multiplier={leverage_risk_multiplier:.4f}, expected_risk_multiplier={expected_risk_multiplier:.4f}, total={risk_overlay_multiplier:.4f}")
 
 # Limit Exposure
-last_price_aligned = last_price.reindex(optimal_positions.index, fill_value=1)
-limit_position = ((optimal_positions * last_price_aligned) / capital).clip(-0.2, 0.4)
-optimal_positions = (limit_position * capital) / last_price_aligned
+limit_position = ((optimal_positions * last_price) / capital).clip(-0.2, 0.4)
+optimal_positions = (limit_position * capital) / last_price
 
 ################################ EXECUÇÃO DE ORDENS (OTIMIZADO) #####################################
-# Ajustar índices
-optimal_positions.index = optimal_positions.index.map(lambda x: f"{x}/USDC:USDC")
 
-# Identificar símbolos para fechar
-symbols_to_close = actual_positions.index.difference(optimal_positions.index)
+# Criar mapeamento reverso: clean_symbol -> exchange_symbol baseado nas posições atuais
+clean_to_exchange_map = {}
+for exchange_symbol in actual_positions_raw.index:
+    clean_symbol = map_exchange_to_clean_symbol(exchange_symbol)
+    clean_to_exchange_map[clean_symbol] = exchange_symbol
 
-# Gerar ordens
+# Para símbolos novos (não em posições atuais), usar o formato padrão
+for clean_symbol in optimal_positions.index:
+    if clean_symbol not in clean_to_exchange_map:
+        clean_to_exchange_map[clean_symbol] = map_clean_to_exchange_symbol(clean_symbol)
+
+# Converter optimal_positions para formato da exchange
+optimal_positions_exchange = pd.Series(dtype='float32')
+for clean_symbol, position in optimal_positions.items():
+    exchange_symbol = clean_to_exchange_map.get(clean_symbol, map_clean_to_exchange_symbol(clean_symbol))
+    optimal_positions_exchange[exchange_symbol] = position
+
+# Identificar símbolos para fechar (estão em posições atuais mas não em optimal)
+symbols_to_close = set(actual_positions_raw.index) - set(optimal_positions_exchange.index)
+
+# Gerar ordens de fechamento
 orders = []
-
-# Ordens de fechamento
 for symbol in symbols_to_close:
-    amount = actual_positions[symbol]
-    if amount == 0:
+    amount = actual_positions_raw[symbol]
+    if abs(amount) < 1e-6:  # Ignorar posições muito pequenas
         continue
     
     orders.append({
@@ -389,36 +429,56 @@ for symbol in symbols_to_close:
         "params": {"reduceOnly": True}
     })
 
-# Remover posições fechadas
-actual_positions = actual_positions.drop(symbols_to_close)
+logging.info(f"Ordens de fechamento: {len(orders)} para símbolos {list(symbols_to_close)}")
 
-# Alinhar índices e calcular trades
-all_symbols = optimal_positions.index.union(actual_positions.index)
-optimal_positions_aligned = optimal_positions.reindex(all_symbols, fill_value=0)
-actual_positions_aligned = actual_positions.reindex(all_symbols, fill_value=0)
-
-trades = optimal_positions_aligned - actual_positions_aligned
+# Calcular trades para símbolos relevantes
+trades_exchange = pd.Series(dtype='float32')
+for exchange_symbol, optimal_pos in optimal_positions_exchange.items():
+    current_pos = actual_positions_raw.get(exchange_symbol, 0)
+    trade_size = optimal_pos - current_pos
+    
+    if abs(trade_size) > 1e-6:  # Apenas trades significativos
+        trades_exchange[exchange_symbol] = trade_size
 
 # Filtrar trades por valor mínimo
-last_price_trades = last_price_aligned.reindex(trades.index, fill_value=1)
-fin_amount = (trades * last_price_trades).abs()
+trades_financial_value = pd.Series(dtype='float32')
+for exchange_symbol, trade_size in trades_exchange.items():
+    clean_symbol = map_exchange_to_clean_symbol(exchange_symbol)
+    price = last_price.get(clean_symbol, 1)  # Default price se não encontrar
+    fin_value = abs(trade_size * price)
+    trades_financial_value[exchange_symbol] = fin_value
 
 # Ajustar trades baseado no valor financeiro
-adjusted_trades = trades.where(~((fin_amount > 0) & (fin_amount < 5)), 0)
-min_amount = (11 / last_price_trades).where(trades != 0, 0) * np.sign(trades)
-adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 11)), min_amount)
+adjusted_trades = pd.Series(dtype='float32')
+for exchange_symbol, trade_size in trades_exchange.items():
+    fin_value = trades_financial_value[exchange_symbol]
+    clean_symbol = map_exchange_to_clean_symbol(exchange_symbol)
+    price = last_price.get(clean_symbol, 1)
+    
+    if fin_value < 5:
+        # Ignorar trades muito pequenos
+        continue
+    elif fin_value < 11:
+        # Ajustar para valor mínimo
+        min_size = 11 / price
+        adjusted_trades[exchange_symbol] = min_size * (1 if trade_size > 0 else -1)
+    else:
+        # Manter trade original
+        adjusted_trades[exchange_symbol] = trade_size
 
 # Gerar ordens normais
-for symbol, amount in adjusted_trades.items():
-    if amount == 0 or pd.isna(amount):
+for exchange_symbol, amount in adjusted_trades.items():
+    if abs(amount) < 1e-6:  # Ignorar valores muito pequenos
         continue
     
     orders.append({
-        "symbol": symbol,
+        "symbol": exchange_symbol,  # Já está no formato correto da exchange
         "type": "market",
         "side": "buy" if amount > 0 else "sell",
         "amount": abs(amount),
     })
+
+logging.info(f"Total de ordens: {len(orders)} (fechamento + novas posições)")
 
 # Executar ordens
 execute_orders = exchange.createOrders(orders) if orders else []
