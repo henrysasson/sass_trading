@@ -50,7 +50,7 @@ engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{D
 
 ###########################################################################################################
 # Subtrair 370 dias
-initial_date = (datetime.today() - timedelta(days=500)).strftime('%Y-%m-%d')
+initial_date = (datetime.today() - timedelta(days=370)).strftime('%Y-%m-%d')
 
 # Montar a query com a data dinâmica
 query = f"""
