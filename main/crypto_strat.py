@@ -246,8 +246,6 @@ n_contracts.index = n_contracts.index.map(lambda x: f"{x}/USDC:USDC")
 upper_buffer.index = upper_buffer.index.map(lambda x: f"{x}/USDC:USDC")
 lower_buffer.index = lower_buffer.index.map(lambda x: f"{x}/USDC:USDC")
 
-
-
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
 
