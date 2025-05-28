@@ -402,8 +402,8 @@ fin_amount = (trades * price).abs()
 adjusted_trades = trades.where(~((fin_amount > 0) & (fin_amount < 5)), 0)
 
 # Substitui onde o valor financeiro está entre 5 e 10 (exclusive) por uma ordem mínima viável
-min_amount = (10 / price).where(trades != 0, 0) * np.sign(trades)
-adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 10)), min_amount)
+min_amount = (11 / price).where(trades != 0, 0) * np.sign(trades)
+adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 11)), min_amount)
 
 # 8. Monta ordens normais (market)
 for symbol, amount in adjusted_trades.items():
