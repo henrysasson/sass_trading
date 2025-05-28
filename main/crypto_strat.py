@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
-load_dotenv(dotenv_path='config/secrets.env')
+load_dotenv()  # Isso carrega automaticamente o .env no diretório atual
+
 
 import ccxt
 import pandas as pd
