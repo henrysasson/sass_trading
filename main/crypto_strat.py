@@ -315,15 +315,22 @@ actual_positions = pd.Series({
     for p in actual_positions_dict
 }, dtype='float32')
 
+# Alinhar índices ANTES da comparação
+all_symbols = n_contracts.index.union(actual_positions.index)
+n_contracts_aligned = n_contracts.reindex(all_symbols, fill_value=0)
+actual_positions_aligned = actual_positions.reindex(all_symbols, fill_value=0)
+upper_buffer_aligned = upper_buffer.reindex(all_symbols, fill_value=0)
+lower_buffer_aligned = lower_buffer.reindex(all_symbols, fill_value=0)
+
 # Posições ótimas
-optimal_positions = n_contracts.where(
-    (actual_positions < lower_buffer) | (actual_positions > upper_buffer),
-    actual_positions
+optimal_positions = n_contracts_aligned.where(
+    (actual_positions_aligned < lower_buffer_aligned) | (actual_positions_aligned > upper_buffer_aligned),
+    actual_positions_aligned
 )
 
 ####################################### RISK OVERLAY (OTIMIZADO) ####################################################
 # Leverage
-leverage = (optimal_positions.abs() * last_price).sum()
+leverage = (optimal_positions.abs() * last_price.reindex(optimal_positions.index, fill_value=0)).sum()
 max_risk_leverage = 2
 
 if leverage == 0:
@@ -332,14 +339,16 @@ else:
     leverage_risk_multiplier = min(1, max_risk_leverage / leverage)
 
 # Expected Risk (versão otimizada)
-dollar_weights = (optimal_positions.abs() * last_price)
-dollar_weights = dollar_weights.reindex(last_percent_vol.index, fill_value=0)
+dollar_weights = (optimal_positions.abs() * last_price.reindex(optimal_positions.index, fill_value=0))
 
 # Usar apenas dados recentes para correlação (reduz uso de memória)
 recent_returns = returns_15min.tail(20*96)
 cmatrix = recent_returns.corr().values
 
-sigma = np.outer(last_percent_vol.values, last_percent_vol.values) * cmatrix
+# Alinhar percent_vol com optimal_positions
+last_percent_vol_aligned = last_percent_vol.reindex(optimal_positions.index, fill_value=0.01)
+
+sigma = np.outer(last_percent_vol_aligned.values, last_percent_vol_aligned.values) * cmatrix
 portfolio_variance = dollar_weights.values.dot(sigma).dot(dollar_weights.values)
 portfolio_std = np.sqrt(portfolio_variance)
 
@@ -352,8 +361,9 @@ optimal_positions = optimal_positions * risk_overlay_multiplier
 logging.info(f"Risk overlay aplicado: leverage_multiplier={leverage_risk_multiplier:.4f}, expected_risk_multiplier={expected_risk_multiplier:.4f}, total={risk_overlay_multiplier:.4f}")
 
 # Limit Exposure
-limit_position = ((optimal_positions * last_price) / capital).clip(-0.2, 0.4)
-optimal_positions = (limit_position * capital) / last_price
+last_price_aligned = last_price.reindex(optimal_positions.index, fill_value=1)
+limit_position = ((optimal_positions * last_price_aligned) / capital).clip(-0.2, 0.4)
+optimal_positions = (limit_position * capital) / last_price_aligned
 
 ################################ EXECUÇÃO DE ORDENS (OTIMIZADO) #####################################
 # Ajustar índices
@@ -384,18 +394,19 @@ actual_positions = actual_positions.drop(symbols_to_close)
 
 # Alinhar índices e calcular trades
 all_symbols = optimal_positions.index.union(actual_positions.index)
-optimal_positions = optimal_positions.reindex(all_symbols, fill_value=0)
-actual_positions = actual_positions.reindex(all_symbols, fill_value=0)
+optimal_positions_aligned = optimal_positions.reindex(all_symbols, fill_value=0)
+actual_positions_aligned = actual_positions.reindex(all_symbols, fill_value=0)
 
-trades = optimal_positions - actual_positions
+trades = optimal_positions_aligned - actual_positions_aligned
 
 # Filtrar trades por valor mínimo
-fin_amount = (trades * last_price.reindex(trades.index, fill_value=0)).abs()
+last_price_trades = last_price_aligned.reindex(trades.index, fill_value=1)
+fin_amount = (trades * last_price_trades).abs()
 
 # Ajustar trades baseado no valor financeiro
 adjusted_trades = trades.where(~((fin_amount > 0) & (fin_amount < 5)), 0)
-min_amount = (10 / last_price.reindex(trades.index, fill_value=1)).where(trades != 0, 0) * np.sign(trades)
-adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 10)), min_amount)
+min_amount = (11 / last_price_trades).where(trades != 0, 0) * np.sign(trades)
+adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 11)), min_amount)
 
 # Gerar ordens normais
 for symbol, amount in adjusted_trades.items():
