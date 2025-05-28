@@ -11,7 +11,7 @@ def format_from_database(formatted_df):
     # Pivot otimizado com agregação explícita
     original_df = formatted_df.pivot_table(
         index='date', columns='symbol', values=value_column, 
-        aggfunc='last'  # 'last' é mais eficiente que 'mean' para dados únicos
+        aggfunc='last', observed=True  # 'last' é mais eficiente que 'mean' para dados únicos
     )
     
     # Conversão eficiente de datetime
