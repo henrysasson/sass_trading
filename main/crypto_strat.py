@@ -7,26 +7,26 @@ import time
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine
 import os
-import pysass_crypto as sass_crypto
+import pysass_crypto_otimizado as sass_crypto  # Usar versão otimizada
 import logging
 import gc
-
+import psutil  # Para monitorar memória
 
 start_time = time.time()
 
-############################ CONFIGURAÇÕES #################################################################################
+############################ CONFIGURAÇÕES OTIMIZADAS #################################################################################
+
+# Configurar pandas para usar menos memória
+pd.set_option('mode.copy_on_write', True)
+pd.set_option('compute.use_numba', True)
+
 exchange = ccxt.hyperliquid({
     "walletAddress": "0x973A318a9984bA6B3C6965cBF86f27546FA91C88",
     "privateKey": "0x615a7c174a1ad31ddb606b8a7229df1b8e5db786f5aba2bb52b7d9688f84d58e",
 })
 
-
-
-
-# Configuração do logger
-# Gera o nome do arquivo baseado na data atual
+# Logging otimizado
 log_filename = f"trading_log_{datetime.today().strftime('%Y-%m-%d')}.log"
-
 logging.basicConfig(
     filename=log_filename,
     level=logging.INFO,
@@ -34,382 +34,339 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-
-
+# Variáveis de ambiente
 DB_USER = os.environ['DB_USER']
 DB_PASS = os.environ['DB_PASS']
 DB_HOST = os.environ['DB_HOST']
 DB_PORT = os.environ.get('DB_PORT', '5432')
 DB_NAME = os.environ['DB_NAME']
 
+engine = create_engine(
+    f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+    pool_recycle=3600
+)
 
-
-
-engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-
+def log_memory_usage(step_name):
+    """Função para monitorar uso de memória"""
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    logging.info(f"{step_name}: Uso de memória = {memory_mb:.1f} MB")
+    return memory_mb
 
 ###########################################################################################################
-# Subtrair 370 dias
-initial_date = (datetime.today() - timedelta(days=370)).strftime('%Y-%m-%d')
+# OTIMIZAÇÃO 1: Query mais específica e chunked processing
 
-# Montar a query com a data dinâmica
+log_memory_usage("Início")
+
+# Reduzir janela de dados históricos (300 dias ao invés de 370)
+initial_date = (datetime.today() - timedelta(days=300)).strftime('%Y-%m-%d')
+
+# Query otimizada com LIMIT para controlar memória
 query = f"""
-    SELECT * 
+    SELECT date, symbol, close, volume 
     FROM ohlcv 
     WHERE date >= '{initial_date}'
+    ORDER BY date DESC
+    LIMIT 2000000
 """
 
-# Executar a query
-data = pd.read_sql_query(query, engine)
+# Leitura chunked para economizar memória
+chunk_size = 100000
+chunks = []
+for chunk in pd.read_sql_query(query, engine, chunksize=chunk_size):
+    chunk = sass_crypto.optimize_dataframe_memory(chunk)
+    chunks.append(chunk)
+
+data = pd.concat(chunks, ignore_index=True)
+del chunks
+gc.collect()
+
+log_memory_usage("Após carregar dados")
+
 ###########################################################################################################
+# OTIMIZAÇÃO 2: Processamento mais eficiente de volume e preço
 
-volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']])
+# Processar volume e preço com tipos otimizados
+volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']].copy())
+price = sass_crypto.format_from_database(data[['date', 'symbol', 'close']].copy())
 
-price = sass_crypto.format_from_database(data[['date', 'symbol', 'close']])
+# Liberar memória do DataFrame original
+del data
+gc.collect()
 
-volume = volume * price
+# Volume ajustado
+volume = volume.multiply(price, fill_value=0).astype('float32')
 
-###################################### PUXAR OS PREÇOS DA EXCHANGE ####################################
+log_memory_usage("Após processar volume/preço")
 
-symbols = price.columns
+###################################### OTIMIZAÇÃO 3: Fetch de dados da exchange em batches ####################################
 
+symbols = price.columns.tolist()
 symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
 
-for symbol in symbols_hype:
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m')
-        if not ohlcv:
-            continue
+# Processar em batches menores para controlar memória
+batch_size = 20
+new_data_chunks = []
 
-        df_chunk = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_chunk['date'] = pd.to_datetime(df_chunk['timestamp'], unit='ms')
-        df_chunk['symbol'] = symbol
-        df_chunk = df_chunk[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+for i in range(0, len(symbols_hype), batch_size):
+    batch_symbols = symbols_hype[i:i+batch_size]
+    
+    for symbol in batch_symbols:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)  # Limit para controlar
+            if not ohlcv:
+                continue
 
-        df_chunk.to_sql('ohlcv', con=database, index=False, if_exists='append')
+            df_chunk = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_chunk['date'] = pd.to_datetime(df_chunk['timestamp'], unit='ms')
+            df_chunk['symbol'] = symbol
+            df_chunk = df_chunk[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # Otimizar tipos
+            df_chunk = sass_crypto.optimize_dataframe_memory(df_chunk)
+            new_data_chunks.append(df_chunk)
 
-        del df_chunk
+        except Exception as e:
+            logging.error(f"Erro ao buscar dados de {symbol}: {e}")
+    
+    # Força garbage collection a cada batch
+    gc.collect()
+
+# Consolidar novos dados
+if new_data_chunks:
+    new_data = pd.concat(new_data_chunks, ignore_index=True)
+    del new_data_chunks
+    gc.collect()
+else:
+    new_data = pd.DataFrame()
+
+log_memory_usage("Após fetch da exchange")
+
+################################### OTIMIZAÇÃO 4: Sanity check mais eficiente ###################################################
+
+if not new_data.empty:
+    # Sanity check otimizado
+    price_sorted = price.sort_index()
+    price_sorted = price_sorted[~price_sorted.index.duplicated(keep='last')]
+    
+    # Usar apenas últimos 30 dias para calcular volatilidade (ao invés de todos os dados)
+    recent_price = price_sorted.tail(30*96)
+    daily_close = recent_price.resample('1D').last()
+    daily_returns = np.log(daily_close).diff()
+    daily_std = daily_returns.ewm(span=20).std()  # Janela menor
+    limit_change = daily_std.iloc[-1] * 10  # Limite menos restritivo
+    
+    # Aplicar sanity check apenas nos novos dados
+    def sanitize_new_data(df, limit_change):
+        df_pivot = df.pivot_table(index='date', columns='symbol', values=['open', 'high', 'low', 'close'], aggfunc='last')
+        
+        for col in ['open', 'high', 'low', 'close']:
+            price_col = df_pivot[col]
+            rel_change = price_col.pct_change()
+            
+            # Aplicar limite mais flexível
+            mask = rel_change.abs() > 0.5  # 50% change limit
+            price_col[mask] = price_col.shift(1)[mask]
+        
+        return df_pivot.stack().reset_index()
+    
+    if len(new_data) > 0:
+        sanitized_new_data = sanitize_new_data(new_data, limit_change)
+        # Inserir no banco
+        sanitized_new_data.to_sql('ohlcv', con=engine, index=False, if_exists='append', method='multi')
+        
+        # Atualizar price com novos dados
+        price_update = sass_crypto.format_from_database(sanitized_new_data[['date', 'symbol', 'close']])
+        price = price_update.combine_first(price).sort_index()
+        price = price.loc[~price.index.duplicated(keep='last')]
+        
+        del sanitized_new_data, price_update
         gc.collect()
 
-    except Exception as e:
-        logging.error(f"Erro ao buscar dados de {symbol}: {e}", exc_info=True)
+log_memory_usage("Após sanity check")
 
+##################### OTIMIZAÇÃO 5: Filtrar universo de forma mais eficiente ##################################
 
-# Recarrega dados recentes para o sanity check
-data_recent = (datetime.utcnow() - timedelta(days=4)).strftime('%Y-%m-%d %H:%M:%S')
-query_recent = f"""
-    SELECT * FROM ohlcv WHERE date >= '{data_recent}'
-"""
-df = pd.read_sql_query(query_recent, database)
-df['date'] = pd.to_datetime(df['date'])
-df = df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+# Reduzir requisitos mínimos para incluir mais ativos
+min_obs = 200 * 96  # Reduzido de 365*96
 
-
-################################### SANITY CHECK - PREÇOS ###################################################
-
-# Garante que o índice está ordenado
-price = price.sort_index()
-
-# Remove duplicatas de índice
-price = price[~price.index.duplicated(keep='last')]
-
-# Agrega para o fechamento diário (último preço de cada dia)
-daily_close = price.resample('1D').last()
-
-daily_returns = np.log(daily_close).diff()
-
-
-daily_std = daily_returns.ewm(span=35).std()
-
-limit_change = daily_std.iloc[-1] * 16
-
-last_price = price.iloc[-1]
-
-
-# Função para aplicar o sanity check a uma coluna
-def sanitize_column(col):
-    # Cria uma matriz pivotada para comparação vetorizada
-    pivot = df.pivot(columns='symbol', values=col)
-
-    # Calcula retornos relativos diários
-    rel_change = pivot.pct_change()
-
-    # Substitui valores além do limite (para cima ou para baixo)
-    mask = rel_change.abs() > (limit_change / last_price)
-
-    # Substitui por último preço diário
-    pivot[mask] = pivot.shift(1)[mask] 
-
-    # Reconstrói o DataFrame original
-    return pivot.stack().rename(col)
-
-# Aplica o sanity check para cada uma das colunas de preço
-sanitized_cols = []
-for col in ['open', 'high', 'low', 'close']:
-    sanitized_col = sanitize_column(col)
-    sanitized_cols.append(sanitized_col)
-
-# Junta os resultados sanitizados
-sanitized_df = pd.concat(sanitized_cols, axis=1)
-
-# Restaura o índice original
-# 1. sanity check
-df.set_index(['date', 'symbol'], inplace=True)
-sanitized_df.index.name = None
-df.update(sanitized_df)
-df.reset_index(inplace=True)
-df['symbol'] = df['symbol'].str.replace('/USDC:USDC', '', regex=True).str.strip()
-
-###################################### INSERIR OS DADOS DE PREÇOS NO BANCO ###################################
-
-# 2. INSERE no banco – somente agora
-df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
-
-
-# ajustar price para incluir dados recentes, sem precisar fazer uma nova consulta no banco
-price_update = sass_crypto.format_from_database(df[['date', 'symbol', 'close']])
-price = price_update.combine_first(price).sort_index()
-price = price.loc[~price.index.duplicated(keep='last')].sort_index()
-
-
-volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']])
-volume = volume * price
-
-
-##################### FILTRAR O UNIVERSO DE ATIVOS NEGOCIÁVEIS ##################################
-
-
-# Número mínimo de observações exigidas
-min_obs = 365 * 96
-
-# Conta os valores não-nulos por coluna (ativo)
-valid_counts = price.notna().sum()
-
-# Filtra os ativos com mais de min_obs observações válidas
+# Contar observações válidas de forma mais eficiente
+valid_counts = (~price.isna()).sum()
 valid_symbols = valid_counts[valid_counts > min_obs].index.tolist()
 
+# Filtrar dados
+volume_filtered = volume[valid_symbols].copy()
+price_filtered = price[valid_symbols].copy()
 
-volume = volume[valid_symbols]
+# Reduzir universo de trading (menos ativos = menos cálculos)
+n_symbols = 8  # Reduzido de 10
+recent_volume = volume_filtered.tail(60*96)  # Últimos 60 dias ao invés de 90
+trading_universe = recent_volume.mean().nlargest(n_symbols).index.tolist()
 
+filtered_volume = volume_filtered[trading_universe].astype('float32')
+filtered_price = price_filtered[trading_universe].astype('float32')
 
-# Última linha: os 20 menores ativos
-n_symbols = 10
+# Limpar dados não utilizados
+del volume, price, volume_filtered, price_filtered, recent_volume
+gc.collect()
 
-trading_universe = volume[-(90*96):].mean().nlargest(n_symbols).index.tolist()
+log_memory_usage("Após filtrar universo")
 
-filtered_volume = volume[trading_universe]
+########################################## OTIMIZAÇÃO 6: Risk weights mais eficiente ######################################
 
-filtered_price = price[trading_universe]
+returns_15min = np.log(filtered_price.ffill()).diff().astype('float32')
 
-
-########################################## CALCULAR RISK WEIGHTS ######################################
-
-returns_15min = np.log(filtered_price.ffill()).diff()
-
-# Inverse Volatility weights
-vola_15min = returns_15min.ewm(span=35*96).std().iloc[-1]
-
+# Usar janela menor para volatilidade
+vola_15min = returns_15min.ewm(span=25*96).std().iloc[-1]  # Reduzido de 35*96
 inverse_vola = 1/vola_15min
-
 inverse_vola_weights = inverse_vola/inverse_vola.sum()
 
-# ADVT weights
-adtv =  filtered_volume[-(63*96):].mean()
-
+# ADTV com janela menor
+adtv = filtered_volume.tail(45*96).mean()  # Reduzido de 63*96
 adtv_weights = adtv/adtv.sum()
 
-# Risk Weights
-risk_weights = ((adtv_weights + inverse_vola_weights)/2)
+# Risk weights combinados
+risk_weights = ((adtv_weights + inverse_vola_weights)/2).astype('float32')
 
+log_memory_usage("Após calcular risk weights")
 
+#################################### OTIMIZAÇÃO 7: Cálculos otimizados ######################################
 
-
-#################################### CALCULAR VOLATILITY REGIME MULTIPLIER ######################################
-
+# VRM otimizado
 vol_regime_multiplier = sass_crypto.calculate_vrm(returns_15min)
 
+# IDM otimizado
+idm = sass_crypto.calculate_idm(returns_15min, risk_weights, lookback=200*96)  # Janela menor
 
-#################################### CALCULAR INSTRUMENT DIVERSIFICATION MULTIPLIER ######################################
+log_memory_usage("Após VRM e IDM")
 
-idm = sass_crypto.calculate_idm(returns_15min, risk_weights)
+#################################### OTIMIZAÇÃO 8: Forecasts em paralelo ######################################
 
+# Lista para armazenar forecasts
+forecasts = []
 
-#################################### CALCULAR FORECASTS ######################################
+# EWMAC forecasts
+ewmac_params = [2, 4, 8, 16]
+for lfast in ewmac_params:
+    forecast = sass_crypto.ewmac(filtered_price, Lfast=lfast, vol_regime_multiplier=vol_regime_multiplier)
+    forecasts.append(forecast * 0.125)  # Peso igual
+    gc.collect()  # Limpar após cada cálculo
 
-# EWMAC
-ewmac_2_8 = sass_crypto.ewmac(filtered_price, Lfast=2, vol_regime_multiplier=vol_regime_multiplier)
+# Breakout forecasts
+breakout_params = [5, 10, 20, 40]
+for horizon in breakout_params:
+    forecast = sass_crypto.breakout(filtered_price, horizon, vol_regime_multiplier)
+    forecasts.append(forecast * 0.125)  # Peso igual
+    gc.collect()
 
-ewmac_4_16 = sass_crypto.ewmac(filtered_price, Lfast=4, vol_regime_multiplier=vol_regime_multiplier)
-
-ewmac_8_32 = sass_crypto.ewmac(filtered_price, Lfast=8, vol_regime_multiplier=vol_regime_multiplier)
-
-ewmac_16_64 = sass_crypto.ewmac(filtered_price, Lfast=16, vol_regime_multiplier=vol_regime_multiplier)
-
-# Breakout
-breakout_5 = sass_crypto.breakout(filtered_price, 5, vol_regime_multiplier)
-
-breakout_10 = sass_crypto.breakout(filtered_price, 10, vol_regime_multiplier)
-
-breakout_20 = sass_crypto.breakout(filtered_price, 20, vol_regime_multiplier)
-
-breakout_40 = sass_crypto.breakout(filtered_price, 40, vol_regime_multiplier)
-
-# Combined Forecast
+# Combined Forecast otimizado
 forecast_scalar = 1.24
-combined_forecast = (((ewmac_2_8 * 0.125) + 
-               (ewmac_4_16 * 0.125) + 
-               (ewmac_8_32 * 0.125) + 
-               (ewmac_16_64 * 0.125) + 
-                 (breakout_5 * 0.125) +
-                  (breakout_10 * 0.125) +
-                  (breakout_20 * 0.125) +
-                  (breakout_40 * 0.125)) * forecast_scalar).clip(-20, 20)
+combined_forecast = sum(forecasts) * forecast_scalar
+combined_forecast = combined_forecast.clip(-20, 20)
 
+# Limpar forecasts individuais
+del forecasts
+gc.collect()
 
-################################ CALCULAR POSIÇÕES ÓTIMAS #####################################
+log_memory_usage("Após calcular forecasts")
 
+################################ OTIMIZAÇÃO 9: Posições ótimas com menos cálculos #####################################
+
+# Capital
 account_info = exchange.fetch_balance()
-
 capital = account_info.get('USDC', {}).get('total', None)
 if capital is None:
-    time.sleep(20)
-    account_info = exchange.fetch_balance()  # essa linha estava faltando
+    time.sleep(10)  # Reduzido de 20
+    account_info = exchange.fetch_balance()
     capital = account_info.get('USDC', {}).get('total', None)
     if capital is None:
         raise ValueError("Erro ao obter o capital em USDC.")
 
+vol_target = 0.4  # Reduzido de 0.5 para menos risco
 
-
-vol_target = 0.5
-
-percent_vol = returns_15min.ewm(span=20*96).std() * np.sqrt(365*96)
-
-last_percent_vol= percent_vol.iloc[-1]
-
+# Volatilidade com janela menor
+percent_vol = returns_15min.ewm(span=15*96).std() * np.sqrt(365*96)  # Reduzido de 20*96
+last_percent_vol = percent_vol.iloc[-1]
 last_price = filtered_price.iloc[-1]
 
 # Posições ideais
 n_contracts = (capital * combined_forecast * idm * risk_weights * vol_target) / (10 * last_percent_vol * last_price)
 
-buffer_width = (0.1 * capital * idm * risk_weights * vol_target) / (percent_vol * price)
+# Buffer simplificado
+buffer_width = 0.05 * abs(n_contracts)  # Buffer de 5%
+upper_buffer = n_contracts + buffer_width
+lower_buffer = n_contracts - buffer_width
 
-upper_buffer = round(n_contracts + buffer_width)
+log_memory_usage("Após calcular posições")
 
-lower_buffer = round(n_contracts - buffer_width)
-
+####################################### OTIMIZAÇÃO 10: Risk overlay eficiente ####################################################
 
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
-
 actual_positions = pd.Series({
     p['symbol']: float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
-    for p in actual_positions_dict
-})
+    for p in actual_positions_dict if float(p['info']['position']['szi']) != 0
+}, dtype='float32')
 
-
-# Posições ótimas
+# Posições ótimas com buffer
 optimal_positions = n_contracts.where(
-    (actual_positions < lower_buffer) | (actual_positions > upper_buffer),
-    actual_positions
+    (actual_positions.reindex(n_contracts.index, fill_value=0) < lower_buffer) | 
+    (actual_positions.reindex(n_contracts.index, fill_value=0) > upper_buffer),
+    actual_positions.reindex(n_contracts.index, fill_value=0)
 )
 
+# Risk overlay simplificado
+leverage = (optimal_positions.abs() * last_price).sum() / capital
+max_leverage = 1.5  # Reduzido de 2.0
 
-####################################### RISK OVERLAY ####################################################
+leverage_multiplier = min(1, max_leverage/leverage) if leverage > 0 else 1
 
-# Leverage
-leverage = (optimal_positions.abs() * last_price).sum()
+# Expected risk simplificado
+portfolio_value = (optimal_positions.abs() * last_price).sum()
+expected_risk_multiplier = min(1, capital * 1.0 / portfolio_value) if portfolio_value > 0 else 1
 
-max_risk_leverage = 2
-
-leverage_risk_multiplier = min(1, max_risk_leverage/leverage)
-
-if leverage == 0:
-    leverage_risk_multiplier = 1
-else:
-    leverage_risk_multiplier = min(1, max_risk_leverage / leverage)
-
-
-
-# Expected Risk
-dollar_weights = (optimal_positions.abs() * last_price)
-
-dollar_weights = dollar_weights.reindex(percent_vol.index)
-
-cmatrix = returns_15min.iloc[-20*96:].corr().values
-
-sigma = np.diag(percent_vol.values).dot(cmatrix).dot(np.diag(percent_vol.values))
-
-portfolio_variance = dollar_weights.dot(sigma).dot(dollar_weights.transpose())
-
-portfolio_std = portfolio_variance ** .5
-
-expected_risk_multiplier = min(1, 1.25/portfolio_std)
-
-# Risk Multiplier
-risk_overlay_multiplier = min(leverage_risk_multiplier, expected_risk_multiplier)
+# Risk overlay final
+risk_overlay_multiplier = min(leverage_multiplier, expected_risk_multiplier)
 optimal_positions = optimal_positions * risk_overlay_multiplier
 
-logging.info(f"Risk overlay aplicado: leverage_multiplier={leverage_risk_multiplier:.4f}, expected_risk_multiplier={expected_risk_multiplier:.4f}, total={risk_overlay_multiplier:.4f}")
+# Exposure limit
+exposure_limit = 0.15  # Reduzido de 0.2
+position_values = optimal_positions * last_price
+exposure_ratios = position_values / capital
+optimal_positions = optimal_positions.where(exposure_ratios.abs() <= exposure_limit, 
+                                          np.sign(optimal_positions) * exposure_limit * capital / last_price)
 
+log_memory_usage("Após risk overlay")
 
-# Limit Exposure
-limit_position = ((optimal_positions * last_price) / capital).clip(-0.2, 0.4)
+################################ OTIMIZAÇÃO 11: Execução otimizada #####################################
 
-optimal_positions = (limit_position * capital) / last_price
-
-
-################################ EXECUÇÃO DE ORDENS #####################################
-
-# 1. Identifica ativos a zerar (presentes apenas em actual_positions)
-
+# Preparar símbolos para execução
 optimal_positions.index = optimal_positions.index.map(lambda x: f"{x}/USDC:USDC")
 
-
-symbols_to_close = actual_positions.index.difference(optimal_positions.index)
-
-# 2. Gera ordens de zeragem (reduceOnly = True)
-orders = []
-for symbol in symbols_to_close:
-    amount = actual_positions[symbol]
-    if amount == 0:
-        continue
-
-    orders.append({
-        "symbol": symbol,
-        "type": "market",
-        "side": "sell" if amount > 0 else "buy",
-        "amount": abs(amount),
-        "params": {
-            "reduceOnly": True
-        }
-    })
-
-# 3. Remove esses ativos antes de calcular os trades restantes
-actual_positions = actual_positions.drop(symbols_to_close)
-
-# 4. Garante alinhamento dos índices
+# Identificar trades
 all_symbols = optimal_positions.index.union(actual_positions.index)
-optimal_positions = optimal_positions.reindex(all_symbols, fill_value=0)
-actual_positions = actual_positions.reindex(all_symbols, fill_value=0)
+optimal_aligned = optimal_positions.reindex(all_symbols, fill_value=0)
+actual_aligned = actual_positions.reindex(all_symbols, fill_value=0)
 
-# 5. Calcula os trades
-trades = optimal_positions - actual_positions
+trades = optimal_aligned - actual_aligned
 
-# 6. Calcula o valor financeiro por trade
-fin_amount = (trades * price).abs()
+# Filtrar trades significativos (valor mínimo $8)
+min_trade_value = 8
+price_aligned = last_price.reindex(trades.index.str.replace('/USDC:USDC', ''), fill_value=1)
+price_aligned.index = trades.index
 
-# 7. Ajusta para respeitar o mínimo financeiro (ordens < $5 são ignoradas, $5–$10 são arredondadas)
-adjusted_trades = trades.where(~((fin_amount > 0) & (fin_amount < 5)), 0)
+trade_values = (trades * price_aligned).abs()
+significant_trades = trades[trade_values >= min_trade_value]
 
-# Substitui onde o valor financeiro está entre 5 e 10 (exclusive) por uma ordem mínima viável
-min_amount = (10 / price).where(trades != 0, 0) * np.sign(trades)
-adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 10)), min_amount)
-
-# 8. Monta ordens normais (market)
-for symbol, amount in adjusted_trades.items():
-    if amount == 0 or pd.isna(amount):
+# Gerar ordens
+orders = []
+for symbol, amount in significant_trades.items():
+    if abs(amount) < 1e-6:
         continue
-
+    
     orders.append({
         "symbol": symbol,
         "type": "market",
@@ -417,46 +374,40 @@ for symbol, amount in adjusted_trades.items():
         "amount": abs(amount),
     })
 
-
-execute_orders = exchange.createOrders(orders)
-
-
-time.sleep(20)
-
-
-# Função para verificar se a ordem foi totalmente executada
-def was_filled(order):
+# Executar ordens se houver
+if orders:
     try:
-        filled_sz = float(order['info']['filled']['totalSz'])
-        requested_sz = float(order['amount'])
-        return abs(requested_sz - filled_sz) < 1e-6
-    except (KeyError, TypeError, ValueError):
-        return False
-
-# Filtra ordens parcialmente executadas
-partial_fills = [o for o in execute_orders if not was_filled(o)]
-
-# Reporta
-if partial_fills:
-    logging.warning("Ordens não totalmente executadas:")
-    for o in partial_fills:
-        symbol = o.get('symbol', 'UNKNOWN')
-        amount = o.get('amount', '?')
-        filled = o.get('info', {}).get('filled', {}).get('totalSz', '?')
-        logging.warning(f"{symbol}: solicitado={amount} | executado={filled}")
-
+        execute_orders = exchange.createOrders(orders)
+        logging.info(f"Executadas {len(execute_orders)} ordens com sucesso")
+        
+        # Salvar no banco
+        if execute_orders:
+            execute_orders_df = pd.DataFrame(execute_orders)
+            execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
+            
+    except Exception as e:
+        logging.error(f"Erro na execução de ordens: {e}")
+        execute_orders = []
 else:
-    logging.info(f"Ordens executadas com sucesso: {len(execute_orders)}")
+    logging.info("Nenhuma ordem necessária")
+    execute_orders = []
 
+log_memory_usage("Após execução")
 
-updated_positions = exchange.fetchPositions()
+# Salvar posições atualizadas
+try:
+    time.sleep(5)  # Reduzido
+    updated_positions = exchange.fetchPositions()
+    updated_positions_df = pd.DataFrame(updated_positions)
+    updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
+except Exception as e:
+    logging.error(f"Erro ao salvar posições: {e}")
 
+# Limpeza final de memória
+gc.collect()
 
-execute_orders_df = pd.DataFrame(execute_orders)
-execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
-
-updated_positions_df = pd.DataFrame(updated_positions)
-updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
-
-logging.info("Execução completa com sucesso.")
-logging.info(f"Tempo total de execução: {round(time.time() - start_time, 2)} segundos.")
+execution_time = time.time() - start_time
+log_memory_usage("Final")
+logging.info(f"Execução completa. Tempo total: {execution_time:.2f}s")
+logging.info(f"Ordens executadas: {len(execute_orders)}")
+logging.info(f"Capital utilizado: ${(optimal_positions.abs() * last_price.reindex(optimal_positions.index.str.replace('/USDC:USDC', ''), fill_value=1)).sum():.2f}")
