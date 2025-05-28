@@ -67,8 +67,8 @@ log_memory_usage("carregamento inicial")
 
 # OTIMIZAÇÃO 2: Processar price e volume de forma mais eficiente
 # Usar pivot_table diretamente é mais eficiente que a função customizada
-price = data.pivot_table(index='date', columns='symbol', values='close', aggfunc='last').astype('float32')
-volume_raw = data.pivot_table(index='date', columns='symbol', values='volume', aggfunc='last').astype('float32')
+price = data.pivot_table(index='date', columns='symbol', values='close', aggfunc='last', observed=True).astype('float32')
+volume_raw = data.pivot_table(index='date', columns='symbol', values='volume', aggfunc='last', observed=True).astype('float32')
 
 # Limpar dados originais imediatamente
 del data
@@ -150,25 +150,46 @@ last_price = price.iloc[-1]
 
 # Função otimizada para sanity check
 def sanitize_dataframe_efficient(df, limit_change, last_price):
-    """Versão otimizada do sanity check"""
-    df_pivot = df.set_index(['date', 'symbol'])
+    """Versão super otimizada do sanity check"""
+    # Remover duplicatas e ordenar
+    df_clean = df.drop_duplicates(subset=['date', 'symbol'], keep='last').sort_values(['date', 'symbol'])
     
-    for col in ['open', 'high', 'low', 'close']:
-        col_data = df_pivot[col].unstack(fill_value=np.nan)
-        
-        # Calcular mudanças percentuais vetorizadamente
-        pct_change = col_data.pct_change()
-        
-        # Criar máscara para valores anômalos
-        mask = pct_change.abs() > (limit_change / last_price).reindex(col_data.columns, fill_value=np.inf)
-        
-        # Substituir valores anômalos
-        col_data[mask] = col_data.shift(1)[mask]
-        
-        # Atualizar dados originais
-        df_pivot[col] = col_data.stack()
+    # Agrupar por símbolo e processar cada um separadamente (mais eficiente em memória)
+    sanitized_chunks = []
     
-    return df_pivot.reset_index()
+    for symbol in df_clean['symbol'].unique():
+        symbol_data = df_clean[df_clean['symbol'] == symbol].copy().sort_values('date')
+        
+        if len(symbol_data) < 2:
+            sanitized_chunks.append(symbol_data)
+            continue
+        
+        # Obter limite para este símbolo
+        symbol_limit = limit_change.get(symbol, np.inf) if symbol in limit_change.index else np.inf
+        if symbol in last_price.index and last_price[symbol] != 0:
+            symbol_limit = symbol_limit / last_price[symbol]
+        else:
+            symbol_limit = np.inf
+        
+        # Processar cada coluna de preço
+        for col in ['open', 'high', 'low', 'close']:
+            if col in symbol_data.columns:
+                prices = symbol_data[col].values
+                pct_changes = np.diff(prices) / prices[:-1]
+                
+                # Identificar mudanças anômalas
+                anomalous_mask = np.abs(pct_changes) > symbol_limit
+                
+                # Substituir valores anômalos pelo valor anterior
+                for i in range(1, len(prices)):
+                    if anomalous_mask[i-1]:
+                        prices[i] = prices[i-1]
+                
+                symbol_data[col] = prices
+        
+        sanitized_chunks.append(symbol_data)
+    
+    return pd.concat(sanitized_chunks, ignore_index=True)
 
 # Aplicar sanity check otimizado
 df_sanitized = sanitize_dataframe_efficient(df, limit_change, last_price)
