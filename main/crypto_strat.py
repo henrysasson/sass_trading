@@ -198,7 +198,7 @@ def sanitize_dataframe_efficient(df, limit_change, last_price):
     return pd.concat(sanitized_chunks, ignore_index=True)
 
 # Inserir dados sanitizados (MANTER FORMATO ORIGINAL DOS SÍMBOLOS)
-df_sanitized = sanitize_dataframe_efficient(df=price, limit_change=limit_change, last_price=last_price)
+df_sanitized = sanitize_dataframe_efficient(df, limit_change, last_price)
 
 df_sanitized.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
