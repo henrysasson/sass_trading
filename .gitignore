@@ -1,14 +1,24 @@
-# Arquivos de log e banco
-*.log
-*.db
-logs/
-.env
-
-# Python
 __pycache__/
 *.py[cod]
-.ipynb_checkpoints/
+*.egg-info/
+*.log
+*.sqlite3
+*.db
 
-# IDEs e sistema
-.vscode/
+# Virtual Environment
+venv/
+
+# Logs
+logs/
+*.log
+
+# IDEs e arquivos temporários
+*.swp
+*.swo
 .DS_Store
+.vscode/
+*.bak
+
+# Config
+config/secrets.env
+.env
