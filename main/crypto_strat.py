@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 import time
 from datetime import datetime, timedelta
-import sqlite3
+from sqlalchemy import create_engine
+import os
 import pysass_crypto as sass_crypto
 import logging
 import gc
@@ -33,9 +34,17 @@ logging.basicConfig(
 
 
 
-# Connect to the SQLite database
-database = sqlite3.connect('crypto_data.db')
-cursor = database.cursor()
+DB_USER = os.environ['DB_USER']
+DB_PASS = os.environ['DB_PASS']
+DB_HOST = os.environ['DB_HOST']
+DB_PORT = os.environ.get('DB_PORT', '5432')
+DB_NAME = os.environ['DB_NAME']
+
+
+
+
+engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+
 
 ###########################################################################################################
 # Subtrair 370 dias
@@ -49,7 +58,7 @@ query = f"""
 """
 
 # Executar a query
-data = pd.read_sql_query(query, database)
+data = pd.read_sql_query(query, engine)
 ###########################################################################################################
 
 volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']])
@@ -152,7 +161,7 @@ df['symbol'] = df['symbol'].str.replace('/USDC:USDC', '', regex=True).str.strip(
 ###################################### INSERIR OS DADOS DE PREÇOS NO BANCO ###################################
 
 # 2. INSERE no banco – somente agora
-df.to_sql('ohlcv', con=database, index=False, if_exists='append')
+df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
 
 # ajustar price para incluir dados recentes, sem precisar fazer uma nova consulta no banco
@@ -442,10 +451,10 @@ updated_positions = exchange.fetchPositions()
 
 
 execute_orders_df = pd.DataFrame(execute_orders)
-execute_orders_df.to_sql('orders', con=database, index=False, if_exists='append')
+execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
 
 updated_positions_df = pd.DataFrame(updated_positions)
-updated_positions_df.to_sql('positions', con=database, index=False, if_exists='append')
+updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
 
 logging.info("Execução completa com sucesso.")
 logging.info(f"Tempo total de execução: {round(time.time() - start_time, 2)} segundos.")
