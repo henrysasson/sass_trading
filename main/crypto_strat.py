@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv(dotenv_path='config/secrets.env')
+
 import ccxt
 import pandas as pd
 import numpy as np
