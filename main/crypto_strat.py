@@ -239,7 +239,7 @@ last_price = filtered_price.iloc[-1]
 # Posições ideais
 n_contracts = (capital * combined_forecast * idm * risk_weights * vol_target) / (10 * last_percent_vol * last_price)
 
-buffer_width = (0.1 * capital * idm * risk_weights * vol_target) / (percent_vol * price)
+buffer_width = (0.1 * capital * idm * risk_weights * vol_target) / (last_percent_vol * last_price)
 
 upper_buffer = round(n_contracts + buffer_width)
 
