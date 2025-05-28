@@ -17,7 +17,7 @@ start_time = time.time()
 # Monitoramento de memória
 def log_memory_usage(step):
     memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
-    logging.info(f"Memória após {step}: {memory_mb:.1f}MB")
+    logging.info(f"Memória {step}: {memory_mb:.1f}MB")
 
 ############################ CONFIGURAÇÕES #################################################################################
 exchange = ccxt.hyperliquid({
@@ -221,6 +221,8 @@ if capital is None:
     capital = account_info.get('USDC', {}).get('total', None)
     if capital is None:
         raise ValueError("Erro ao obter o capital em USDC.")
+
+logging.info(f"Capital: {capital} USDC")
 
 
 
