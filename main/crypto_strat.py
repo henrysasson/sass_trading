@@ -146,60 +146,6 @@ df = pd.read_sql_query(query_recent, engine, dtype={
 df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
 df = df.dropna(subset=['date'])
 
-################################### SANITY CHECK - PREÇOS (OTIMIZADO) ###################################
-# # Calcular limites apenas uma vez
-# daily_close = price.resample('1D').last()
-# daily_returns = np.log(daily_close).diff()
-# daily_std = daily_returns.ewm(span=35).std()
-# limit_change = daily_std.iloc[-1] * 16
-# last_price = price.iloc[-1]
-
-# # Função otimizada para sanity check
-# def sanitize_dataframe_efficient(df, limit_change, last_price):
-#     """Versão super otimizada do sanity check"""
-#     # Remover duplicatas e ordenar
-#     df_clean = df.drop_duplicates(subset=['date', 'symbol'], keep='last').sort_values(['date', 'symbol'])
-    
-#     # Agrupar por símbolo e processar cada um separadamente (mais eficiente em memória)
-#     sanitized_chunks = []
-    
-#     for symbol in df_clean['symbol'].unique():
-#         symbol_data = df_clean[df_clean['symbol'] == symbol].copy().sort_values('date')
-        
-#         if len(symbol_data) < 2:
-#             sanitized_chunks.append(symbol_data)
-#             continue
-        
-#         # Obter limite para este símbolo
-#         symbol_limit = limit_change.get(symbol, np.inf) if symbol in limit_change.index else np.inf
-#         if symbol in last_price.index and last_price[symbol] != 0:
-#             symbol_limit = symbol_limit / last_price[symbol]
-#         else:
-#             symbol_limit = np.inf
-        
-#         # Processar cada coluna de preço
-#         for col in ['open', 'high', 'low', 'close']:
-#             if col in symbol_data.columns:
-#                 prices = symbol_data[col].values
-#                 pct_changes = np.diff(prices) / prices[:-1]
-                
-#                 # Identificar mudanças anômalas
-#                 anomalous_mask = np.abs(pct_changes) > symbol_limit
-                
-#                 # Substituir valores anômalos pelo valor anterior
-#                 for i in range(1, len(prices)):
-#                     if anomalous_mask[i-1]:
-#                         prices[i] = prices[i-1]
-                
-#                 symbol_data[col] = prices
-        
-#         sanitized_chunks.append(symbol_data)
-    
-#     return pd.concat(sanitized_chunks, ignore_index=True)
-
-# # # Inserir dados sanitizados (MANTER FORMATO ORIGINAL DOS SÍMBOLOS)
-# df_sanitized = sanitize_dataframe_efficient(df, limit_change, last_price)
-
 df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
 # OTIMIZAÇÃO 5: Atualizar price de forma mais eficiente
@@ -220,7 +166,7 @@ volume = volume_update.combine_first(volume).sort_index()
 volume = volume.loc[~volume.index.duplicated(keep='last')]
 
 # Limpar dados temporários
-del df, price_update, volume_update, daily_close, daily_returns, daily_std
+del df, price_update, volume_update
 gc.collect()
 log_memory_usage("após sanity check")
 
