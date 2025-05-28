@@ -1,227 +1,178 @@
 import pandas as pd
 import numpy as np
-import gc
 
 def format_from_database(formatted_df):
     """
-    Reformats a structured DataFrame back to its original format.
-    OTIMIZAÇÃO: Reduz uso de memória com dtypes específicos e processamento chunked.
+    Versão otimizada: usa pivot_table diretamente e tipos de dados eficientes
     """
-    # Otimização de tipos de dados
-    if 'date' in formatted_df.columns:
-        formatted_df['date'] = pd.to_datetime(formatted_df['date'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
-    
     # Identificar coluna de valor
     value_column = formatted_df.columns[2]
     
-    # Converter para float32 para economizar memória (suficiente para preços crypto)
-    formatted_df[value_column] = pd.to_numeric(formatted_df[value_column], errors='coerce').astype('float32')
-    
-    # Pivot otimizado
+    # Pivot otimizado com agregação explícita
     original_df = formatted_df.pivot_table(
-        index='date', 
-        columns='symbol', 
-        values=value_column, 
-        aggfunc='last'  # 'last' é mais rápido que 'mean' para dados únicos
+        index='date', columns='symbol', values=value_column, 
+        aggfunc='last'  # 'last' é mais eficiente que 'mean' para dados únicos
     )
     
-    # Limpeza de memória
-    del formatted_df
-    gc.collect()
+    # Conversão eficiente de datetime
+    if not pd.api.types.is_datetime64_any_dtype(original_df.index):
+        original_df.index = pd.to_datetime(original_df.index, errors='coerce')
     
-    # Garantir ordenação temporal
-    original_df = original_df.sort_index()
-    
-    return original_df
-
+    return original_df.sort_index()
 
 def calculate_vrm(returns, vol_span=35*96, smooth_span=10*96, long_term_window=365*96, quantile_window=365*96):
     """
-    OTIMIZAÇÃO: Calcula apenas o último valor VRM usando apenas dados necessários.
+    Versão otimizada: reduz uso de memória e cálculos desnecessários
     """
-    # Usar apenas dados suficientes para cálculo (economiza ~80% da memória)
+    # Usar apenas dados necessários
     min_required = max(vol_span, long_term_window) + smooth_span
-    if len(returns) > min_required:
-        returns = returns.tail(min_required)
+    if len(returns) > min_required * 1.5:  # Se temos dados demais, usar apenas o necessário
+        returns = returns.tail(int(min_required * 1.2))
     
-    # Volatilidade com float32
-    vol = returns.ewm(span=vol_span, min_periods=vol_span//2).std().astype('float32')
+    # Cálculo da volatilidade com tipos float32
+    vol = returns.astype('float32').ewm(span=vol_span, min_periods=vol_span//2).std()
+    vol = vol.dropna()
     
-    # Apenas últimas observações para média de longo prazo
+    # Média de longo prazo - apenas onde necessário
     long_term_avg = vol.rolling(window=long_term_window, min_periods=long_term_window//2).mean()
     
-    # Vol normalizada suavizada - apenas final
+    # Vol normalizada suavizada
     norm_vol = (vol / long_term_avg).ewm(span=smooth_span).mean()
     
-    # Otimização: calcular quantil apenas para o último valor
-    last_val = norm_vol.iloc[-1]
-    historical = norm_vol.iloc[:-1]
+    # Cálculo eficiente do quantil apenas para o último valor
+    last_values = norm_vol.iloc[-1]
     
-    # Quantil vetorizado mais eficiente
-    vol_quantile = pd.Series(index=last_val.index, dtype='float32')
-    for asset in last_val.index:
-        if pd.notna(last_val[asset]) and len(historical[asset].dropna()) > 0:
-            vol_quantile[asset] = (historical[asset] < last_val[asset]).sum() / len(historical[asset].dropna())
+    # Para cada ativo, calcular o quantil usando apenas dados históricos válidos
+    vol_quantile = pd.Series(index=last_values.index, dtype='float32')
+    
+    for asset in last_values.index:
+        historical_values = norm_vol[asset].iloc[:-1].dropna()
+        if len(historical_values) > 10:  # Mínimo de pontos para quantil
+            current_value = last_values[asset]
+            vol_quantile[asset] = (historical_values < current_value).mean()
         else:
-            vol_quantile[asset] = 0.5  # Default neutro
+            vol_quantile[asset] = 0.5  # Default para casos com poucos dados
     
-    multiplier = (2.0 - 1.5 * vol_quantile).clip(0.1, 3.0)  # Limitar range
+    # Multiplicador
+    multiplier = 2.0 - 1.5 * vol_quantile
     
-    # Limpeza
-    del vol, long_term_avg, norm_vol
-    gc.collect()
-    
-    return multiplier
-
+    return multiplier.astype('float32')
 
 def calculate_idm(returns, risk_weights, lookback=365*96, max_idm=2.5):
     """
-    OTIMIZAÇÃO: IDM mais eficiente com menos uso de memória.
+    Versão otimizada: usa menos memória e cálculos mais eficientes
     """
     import warnings
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     
     # Usar apenas dados necessários
-    window_data = returns.tail(lookback)
+    window_data = returns.tail(lookback).astype('float32')
     
-    # Correlação apenas para ativos com pesos
-    valid_assets = risk_weights.index
-    returns_subset = window_data[valid_assets].dropna()
+    # Calcular correlação de forma mais eficiente
+    corr_matrix = window_data.corr().values.astype('float32')
     
-    if len(returns_subset) < 50:  # Mínimo de observações
-        return 1.0
-    
-    # Matriz de correlação com float32
-    corr_matrix = returns_subset.corr().values.astype('float32')
-    
-    # Ajustes de correlação mais eficientes
+    # Ajustar correlação (vetorizado)
     np.fill_diagonal(corr_matrix, 1.0)  # Garantir diagonal = 1
-    corr_matrix = np.clip(corr_matrix, 0, 1)  # Clip valores negativos
+    corr_matrix = np.clip(corr_matrix, 0, 1)  # Clip é mais eficiente que where duplo
     
+    # Cálculo IDM otimizado
     weights = risk_weights.values.astype('float32')
-    
-    # Cálculo WHWT vetorizado
     WHWT = np.dot(weights, np.dot(corr_matrix, weights))
     
-    # IDM com proteção contra divisão por zero
     if WHWT > 0:
-        diversification_multiplier = min(1 / np.sqrt(WHWT), max_idm)
+        diversification_multiplier = 1 / np.sqrt(WHWT)
+        idm = min(diversification_multiplier, max_idm)
     else:
-        diversification_multiplier = 1.0
+        idm = 1.0
     
-    # Limpeza
-    del corr_matrix, returns_subset
-    gc.collect()
-    
-    return diversification_multiplier
-
+    return float(idm)
 
 def ewmac(price, Lfast, Lslow=None, vol_regime_multiplier=None):
     """
-    OTIMIZAÇÃO: EWMAC mais eficiente usando apenas dados necessários.
+    Versão otimizada: reduz cópias desnecessárias e usa cálculos vetorizados
     """
+    # Trabalhar com float32 para economizar memória
+    price_data = price.astype('float32')
+    
     # Ajuste de janelas
-    Lfast_adjusted = round(Lfast * 96)
-    Lslow = round(4 * Lfast_adjusted)
-    vol_span = round(35 * 96)
+    Lfast_adjusted = int(Lfast * 96)
+    Lslow = int(4 * Lfast_adjusted)
+    vol_span = int(35 * 96)
     
-    # Usar apenas dados suficientes (economiza ~70% da memória)
-    min_required = max(Lslow, vol_span) * 3
-    if len(price) > min_required:
-        price_subset = price.tail(min_required).astype('float32')
-    else:
-        price_subset = price.astype('float32')
+    # Usar apenas dados necessários (evitar cálculos desnecessários)
+    min_required = max(Lslow, vol_span) * 2
+    if len(price_data) > min_required:
+        price_data = price_data.tail(min_required)
     
-    # Cálculos EWMAC otimizados
-    fast_ewma = price_subset.ewm(span=Lfast_adjusted, min_periods=Lfast_adjusted//2).mean()
-    slow_ewma = price_subset.ewm(span=Lslow, min_periods=Lslow//2).mean()
+    # Cálculo EWMAC otimizado
+    fast_ewma = price_data.ewm(span=Lfast_adjusted, min_periods=Lfast_adjusted//2).mean()
+    slow_ewma = price_data.ewm(span=Lslow, min_periods=Lslow//2).mean()
     
-    # Apenas último valor
     raw_ewmac = (fast_ewma - slow_ewma).iloc[-1]
     
-    # Volatilidade ajustada
-    returns = price_subset.diff()
+    # Volatility Adjustment
+    returns = price_data.diff()
     stdev_returns = returns.ewm(span=vol_span, min_periods=vol_span//2).std().iloc[-1]
     stdev_returns *= np.sqrt((60/15) * 24 * 365)
     
     # Forecast ajustado
     vol_adj_ewmac = raw_ewmac / stdev_returns
-    vol_adj_ewmac = vol_adj_ewmac.replace([np.inf, -np.inf], np.nan).fillna(0)
+    vol_adj_ewmac = vol_adj_ewmac.replace([np.inf, -np.inf], 0)
     
     # Aplicar multiplicador de regime
     if vol_regime_multiplier is not None:
-        vol_adj_ewmac = vol_adj_ewmac * vol_regime_multiplier
+        vol_adj_ewmac = vol_adj_ewmac * vol_regime_multiplier.astype('float32')
     
-    # Scalar e cap
+    # Forecast scalar otimizado (lookup table)
     scalar_dict = {16: 89.14, 8: 128.48, 4: 179.06, 2: 254.60}
-    forecast_scalar = scalar_dict.get(Lfast, 100)
+    forecast_scalar = scalar_dict.get(Lfast, 1.0)
     
     scaled_forecast = vol_adj_ewmac * forecast_scalar
-    capped_forecast = scaled_forecast.clip(-20, 20)
     
-    # Limpeza
-    del fast_ewma, slow_ewma, returns, price_subset
-    gc.collect()
-    
-    return capped_forecast
-
+    return scaled_forecast.clip(-20, 20).astype('float32')
 
 def breakout(price, horizon, vol_regime_multiplier):
     """
-    OTIMIZAÇÃO: Breakout mais eficiente com menos uso de memória.
+    Versão otimizada: reduz uso de memória e cálculos redundantes
     """
-    horizon_adjusted = round(horizon * 96)
+    # Trabalhar com float32
+    price_data = price.astype('float32')
+    
+    # Ajuste da janela
+    horizon_adjusted = int(horizon * 96)
     
     # Usar apenas dados necessários
     min_required = horizon_adjusted * 3
-    if len(price) > min_required:
-        price_subset = price.tail(min_required).astype('float32')
-    else:
-        price_subset = price.astype('float32')
+    if len(price_data) > min_required:
+        price_data = price_data.tail(min_required)
     
-    # Cálculos de breakout otimizados
-    max_price = price_subset.rolling(window=horizon_adjusted, min_periods=horizon_adjusted//2).max()
-    min_price = price_subset.rolling(window=horizon_adjusted, min_periods=horizon_adjusted//2).min()
-    mean_price = (max_price + min_price) / 2
+    # Cálculo otimizado das bandas
+    rolling_window = price_data.rolling(window=horizon_adjusted, min_periods=max(1, horizon_adjusted//4))
+    max_price = rolling_window.max()
+    min_price = rolling_window.min()
     
-    # Proteção contra divisão por zero
+    # Cálculos vetorizados
+    mean_price = (max_price + min_price) * 0.5
     range_price = max_price - min_price
-    range_price = range_price.where(range_price > 1e-6, np.nan)
     
-    # Forecast bruto apenas para último valor
-    current_price = price_subset.iloc[-1]
-    current_mean = mean_price.iloc[-1]
-    current_range = range_price.iloc[-1]
+    # Proteção contra divisão por zero (mais eficiente)
+    range_price = np.where(range_price < 1e-6, np.nan, range_price)
     
-    raw_forecast = 40 * (current_price - current_mean) / current_range
-    raw_forecast = raw_forecast.fillna(0)
+    # Forecast bruto
+    raw_forecast = 40 * (price_data - mean_price) / range_price
+    
+    # Suavização
+    smooth_span = max(1, horizon_adjusted // 4)
+    smoothed_forecast = raw_forecast.ewm(span=smooth_span, min_periods=1).mean().iloc[-1]
     
     # Aplicar multiplicador de regime
     if vol_regime_multiplier is not None:
-        raw_forecast = raw_forecast * vol_regime_multiplier.astype('float32')
+        smoothed_forecast = smoothed_forecast * vol_regime_multiplier.astype('float32')
     
-    # Scalar e cap
+    # Scalar (lookup table otimizada)
     scalar_dict = {40: 0.80, 20: 0.80, 10: 0.80, 5: 0.80}
     forecast_scalar = scalar_dict.get(horizon, 0.80)
     
-    scaled_forecast = raw_forecast * forecast_scalar
-    capped_forecast = scaled_forecast.clip(-20, 20)
+    scaled_forecast = smoothed_forecast * forecast_scalar
     
-    # Limpeza
-    del max_price, min_price, mean_price, range_price, price_subset
-    gc.collect()
-    
-    return capped_forecast
-
-
-def optimize_dataframe_memory(df):
-    """
-    Função auxiliar para otimizar uso de memória de DataFrames.
-    """
-    for col in df.columns:
-        if df[col].dtype == 'float64':
-            df[col] = df[col].astype('float32')
-        elif df[col].dtype == 'int64':
-            df[col] = df[col].astype('int32')
-    
-    return df
+    return scaled_forecast.clip(-20, 20).astype('float32')
