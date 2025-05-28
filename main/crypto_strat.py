@@ -101,7 +101,7 @@ for symbol in symbols_hype:
         df_chunk['symbol'] = clean_symbol
         df_chunk = df_chunk[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
 
-        df_chunk.to_sql('ohlcv', con=database, index=False, if_exists='append')
+        df_chunk.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
         del df_chunk
         gc.collect()
