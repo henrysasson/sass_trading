@@ -91,9 +91,10 @@ symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
 for symbol in symbols_hype:
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m')
-        if not ohlcv:
-            continue
-
+        
+        if not isinstance(ohlcv, list) or len(ohlcv) == 0 or not all(isinstance(row, list) and len(row) == 6 for row in ohlcv):
+            raise ValueError(f"Formato inesperado de OHLCV para {symbol}: {ohlcv}")
+    
         df_chunk = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df_chunk['date'] = pd.to_datetime(df_chunk['timestamp'], unit='ms')
         clean_symbol = symbol.replace('/USDC:USDC', '').replace('/USD:USD', '').replace('/USDT:USDT', '').strip()
@@ -241,9 +242,10 @@ lower_buffer = n_contracts - buffer_width
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
 actual_positions_raw = pd.Series({
-    p['symbol']: float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
-    for p in actual_positions_dict if float(p['info']['position']['szi']) != 0  # Apenas posições não-zero
+    map_exchange_to_clean_symbol(p['info']['symbol']): float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
+    for p in actual_positions_dict if float(p['info']['position']['szi']) != 0
 }, dtype='float32')
+
 
 # CORREÇÃO ROBUSTA: Mapear símbolos da exchange para formato do banco
 def map_exchange_to_clean_symbol(exchange_symbol):
@@ -324,6 +326,10 @@ logging.info(f"Risk overlay aplicado: leverage_multiplier={leverage_risk_multipl
 # Limit Exposure
 limit_position = ((optimal_positions * last_price) / capital).clip(-0.2, 0.4)
 optimal_positions = (limit_position * capital) / last_price
+
+# Log informativo das posições ótimas
+logging.info(f"Posições ótimas:\n{optimal_positions.to_string()}")
+
 
 ################################ EXECUÇÃO DE ORDENS (OTIMIZADO) #####################################
 
