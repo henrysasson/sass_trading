@@ -1,29 +1,29 @@
-from dotenv import load_dotenv
-load_dotenv()  # Isso carrega automaticamente o .env no diretório atual
-
-
 import ccxt
 import pandas as pd
 import numpy as np
 import time
 from datetime import datetime, timedelta
+import sqlite3
 import pysass_crypto as sass_crypto
 import logging
-from sqlalchemy import create_engine
-import os
+import gc
+
 
 start_time = time.time()
 
 ############################ CONFIGURAÇÕES #################################################################################
-############################ CONFIGURAÇÕES DE SEGURANÇA #######################################################
 exchange = ccxt.hyperliquid({
-    "walletAddress": os.environ['WALLET_ADDRESS'],
-    "privateKey": os.environ['PRIVATE_KEY'],
+    "walletAddress": "0x973A318a9984bA6B3C6965cBF86f27546FA91C88",
+    "privateKey": "0x615a7c174a1ad31ddb606b8a7229df1b8e5db786f5aba2bb52b7d9688f84d58e",
 })
 
+
+
+
 # Configuração do logger
-log_filename = f"logs/trading_log_{datetime.today().strftime('%Y-%m-%d')}.log"
-os.makedirs('logs', exist_ok=True)
+# Gera o nome do arquivo baseado na data atual
+log_filename = f"trading_log_{datetime.today().strftime('%Y-%m-%d')}.log"
+
 logging.basicConfig(
     filename=log_filename,
     level=logging.INFO,
@@ -31,23 +31,25 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Conexão com o banco PostgreSQL (RDS)
-DB_USER = os.environ['DB_USER']
-DB_PASS = os.environ['DB_PASS']
-DB_HOST = os.environ['DB_HOST']
-DB_PORT = os.environ.get('DB_PORT', '5432')
-DB_NAME = os.environ['DB_NAME']
 
-engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+
+# Connect to the SQLite database
+database = sqlite3.connect('crypto_data.db')
+cursor = database.cursor()
 
 ###########################################################################################################
-# Subtrair 500 dias
-data_inicial = (datetime.today() - timedelta(days=500)).strftime('%Y-%m-%d')
-query = f"""
-    SELECT * FROM ohlcv WHERE date >= '{data_inicial}'
-"""
-data = pd.read_sql_query(query, engine)
+# Subtrair 370 dias
+initial_date = (datetime.today() - timedelta(days=500)).strftime('%Y-%m-%d')
 
+# Montar a query com a data dinâmica
+query = f"""
+    SELECT * 
+    FROM ohlcv 
+    WHERE date >= '{initial_date}'
+"""
+
+# Executar a query
+data = pd.read_sql_query(query, database)
 ###########################################################################################################
 
 volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']])
@@ -58,66 +60,53 @@ volume = volume * price
 
 ###################################### PUXAR OS PREÇOS DA EXCHANGE ####################################
 
+symbols = price.columns
 
-
-# Obtem a lista de símbolos disponíveis na Hyperliquid
 symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
 
-# Conecta ao banco e busca os últimos timestamps
-with engine.connect() as conn:
-    latest_dates = pd.read_sql("""
-        SELECT symbol, MAX(date) as last_date
-        FROM ohlcv
-        GROUP BY symbol
-    """, conn)
-
-# Converte datas para datetime e calcula o 'since' em milissegundos
-latest_dates['last_date'] = pd.to_datetime(latest_dates['last_date'])
-latest_dates['since'] = (latest_dates['last_date'] + pd.Timedelta(minutes=15)).astype(np.int64) // 10**6
-
-# Cria o mapeamento symbol → since, ajustando o sufixo
-symbol_since_map = dict(zip(latest_dates['symbol'], latest_dates['since']))
-
-# Lista para armazenar os dados
-all_data = []
-
-# Loop apenas nos símbolos que já estão no banco
-symbols_in_db = [s for s in symbols_hype if s.replace('/USDC:USDC', '') in symbol_since_map]
-
-for symbol in symbols_in_db:
+for symbol in symbols_hype:
     try:
-        # Remove sufixo para buscar 'since' correto
-        databank_symbol = symbol.replace('/USDC:USDC', '')
-        since = symbol_since_map.get(databank_symbol)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m')
+        if not ohlcv:
+            continue
 
-        if since is None:
-            continue  # Pula se não tiver timestamp de referência
+        df_chunk = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_chunk['date'] = pd.to_datetime(df_chunk['timestamp'], unit='ms')
+        df_chunk['symbol'] = symbol
+        df_chunk = df_chunk[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
 
-        # Busca os dados
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', since=since)
+        df_chunk.to_sql('ohlcv', con=database, index=False, if_exists='append')
 
-        for entry in ohlcv:
-            all_data.append({
-                'date': pd.to_datetime(entry[0], unit='ms'),
-                'symbol': symbol,
-                'open': entry[1],
-                'high': entry[2],
-                'low': entry[3],
-                'close': entry[4],
-                'volume': entry[5],
-            })
+        del df_chunk
+        gc.collect()
 
     except Exception as e:
         logging.error(f"Erro ao buscar dados de {symbol}: {e}", exc_info=True)
 
-# Constrói o DataFrame final
-df = pd.DataFrame(all_data)
+
+# Recarrega dados recentes para o sanity check
+data_recent = (datetime.utcnow() - timedelta(days=4)).strftime('%Y-%m-%d %H:%M:%S')
+query_recent = f"""
+    SELECT * FROM ohlcv WHERE date >= '{data_recent}'
+"""
+df = pd.read_sql_query(query_recent, database)
+df['date'] = pd.to_datetime(df['date'])
 df = df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
 
 
 ################################### SANITY CHECK - PREÇOS ###################################################
 
-daily_returns = np.log(price.resample('D')).diff()
+# Garante que o índice está ordenado
+price = price.sort_index()
+
+# Remove duplicatas de índice
+price = price[~price.index.duplicated(keep='last')]
+
+# Agrega para o fechamento diário (último preço de cada dia)
+daily_close = price.resample('1D').last()
+
+daily_returns = np.log(daily_close).diff()
+
 
 daily_std = daily_returns.ewm(span=35).std()
 
@@ -138,7 +127,7 @@ def sanitize_column(col):
     mask = rel_change.abs() > (limit_change / last_price)
 
     # Substitui por último preço diário
-    pivot[mask] = last_price
+    pivot[mask] = pivot.shift(1)[mask] 
 
     # Reconstrói o DataFrame original
     return pivot.stack().rename(col)
@@ -153,23 +142,29 @@ for col in ['open', 'high', 'low', 'close']:
 sanitized_df = pd.concat(sanitized_cols, axis=1)
 
 # Restaura o índice original
+# 1. sanity check
+df.set_index(['date', 'symbol'], inplace=True)
+sanitized_df.index.name = None
 df.update(sanitized_df)
 df.reset_index(inplace=True)
 df['symbol'] = df['symbol'].str.replace('/USDC:USDC', '', regex=True).str.strip()
 
+###################################### INSERIR OS DADOS DE PREÇOS NO BANCO ###################################
 
-###################################### INSERIR OS DADOS DE PREÇOS NO BANCO ####################################
+# 2. INSERE no banco – somente agora
+df.to_sql('ohlcv', con=database, index=False, if_exists='append')
 
-df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
 
 # ajustar price para incluir dados recentes, sem precisar fazer uma nova consulta no banco
-price = pd.concat([price, sass_crypto.format_from_database(df[['date', 'symbol', 'close']])])
-price.index = pd.to_datetime(price.index)
-price = price[~price.index.duplicated(keep='last')]
-price = price.sort_index()
+price_update = sass_crypto.format_from_database(df[['date', 'symbol', 'close']])
+price = price_update.combine_first(price).sort_index()
+price = price.loc[~price.index.duplicated(keep='last')].sort_index()
 
 
-symbols = price.columns
+volume = sass_crypto.format_from_database(data[['date', 'symbol', 'volume']])
+volume = volume * price
+
+
 ##################### FILTRAR O UNIVERSO DE ATIVOS NEGOCIÁVEIS ##################################
 
 
@@ -295,15 +290,8 @@ lower_buffer = round(n_contracts - buffer_width)
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
 
-def extract_position_size(p):
-    try:
-        return float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
-    except Exception as e:
-        logging.warning(f"Erro ao interpretar posição de {p.get('symbol', '?')}: {e}")
-        return 0.0
-
 actual_positions = pd.Series({
-    p['symbol']: extract_position_size(p)
+    p['symbol']: float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
     for p in actual_positions_dict
 })
 
@@ -403,8 +391,8 @@ fin_amount = (trades * price).abs()
 adjusted_trades = trades.where(~((fin_amount > 0) & (fin_amount < 5)), 0)
 
 # Substitui onde o valor financeiro está entre 5 e 10 (exclusive) por uma ordem mínima viável
-min_amount = (11 / price).where(trades != 0, 0) * np.sign(trades)
-adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 11)), min_amount)
+min_amount = (10 / price).where(trades != 0, 0) * np.sign(trades)
+adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 10)), min_amount)
 
 # 8. Monta ordens normais (market)
 for symbol, amount in adjusted_trades.items():
@@ -454,10 +442,10 @@ updated_positions = exchange.fetchPositions()
 
 
 execute_orders_df = pd.DataFrame(execute_orders)
-execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
+execute_orders_df.to_sql('orders', con=database, index=False, if_exists='append')
 
 updated_positions_df = pd.DataFrame(updated_positions)
-updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
+updated_positions_df.to_sql('positions', con=database, index=False, if_exists='append')
 
 logging.info("Execução completa com sucesso.")
 logging.info(f"Tempo total de execução: {round(time.time() - start_time, 2)} segundos.")
