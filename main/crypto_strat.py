@@ -86,47 +86,27 @@ symbols = price.columns
 symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
 
 # OTIMIZAÇÃO 3: Processar exchange data em chunks menores
-batch_size = 10  # Processar em lotes menores
-for i in range(0, len(symbols_hype), batch_size):
-    batch_symbols = symbols_hype[i:i+batch_size]
-    batch_data = []
-    
-    for symbol in batch_symbols:
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m')
-            if not ohlcv:
-                continue
+symbols_hype = [item['symbol'] for item in exchange.fetchSwapMarkets()]
 
-            # Usar arrays numpy diretamente é mais eficiente
-            ohlcv_array = np.array(ohlcv, dtype=[
-                ('timestamp', 'i8'), ('open', 'f4'), ('high', 'f4'), 
-                ('low', 'f4'), ('close', 'f4'), ('volume', 'f4')
-            ])
-            
-            # CONVERTER SÍMBOLO PARA FORMATO LIMPO ANTES DE SALVAR NO BANCO
-            clean_symbol = symbol.replace('/USDC:USDC', '').replace('/USD:USD', '').replace('/USDT:USDT', '').strip()
-            
-            df_chunk = pd.DataFrame({
-                'date': pd.to_datetime(ohlcv_array['timestamp'], unit='ms'),
-                'symbol': clean_symbol,  # ← Salvar formato limpo no banco
-                'open': ohlcv_array['open'],
-                'high': ohlcv_array['high'],
-                'low': ohlcv_array['low'],
-                'close': ohlcv_array['close'],
-                'volume': ohlcv_array['volume']
-            })
-            
-            batch_data.append(df_chunk)
+for symbol in symbols_hype:
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m')
+        if not ohlcv:
+            continue
 
-        except Exception as e:
-            logging.error(f"Erro ao buscar dados de {symbol}: {e}")
-    
-    # Inserir batch no banco
-    if batch_data:
-        batch_df = pd.concat(batch_data, ignore_index=True)
-        batch_df.to_sql('ohlcv', con=engine, index=False, if_exists='append')
-        del batch_df, batch_data
+        df_chunk = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_chunk['date'] = pd.to_datetime(df_chunk['timestamp'], unit='ms')
+        clean_symbol = symbol.replace('/USDC:USDC', '').replace('/USD:USD', '').replace('/USDT:USDT', '').strip()
+        df_chunk['symbol'] = clean_symbol
+        df_chunk = df_chunk[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+
+        df_chunk.to_sql('ohlcv', con=database, index=False, if_exists='append')
+
+        del df_chunk
         gc.collect()
+
+    except Exception as e:
+        logging.error(f"Erro ao buscar dados de {symbol}: {e}", exc_info=True)
 
 log_memory_usage("após fetch exchange")
 
