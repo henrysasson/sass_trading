@@ -61,7 +61,10 @@ dtype_dict = {
 }
 
 data = pd.read_sql_query(query, engine, dtype=dtype_dict)
-data['date'] = pd.to_datetime(data['date'])
+# Conversão robusta de datetime para lidar com formatos mistos
+data['date'] = pd.to_datetime(data['date'], format='mixed', errors='coerce')
+# Remover linhas com datas inválidas
+data = data.dropna(subset=['date'])
 log_memory_usage("carregamento inicial")
 
 # Usar dados direto para cálculos (símbolos já limpos)
@@ -139,7 +142,9 @@ df = pd.read_sql_query(query_recent, engine, dtype={
     'symbol': 'category', 'open': 'float32', 'high': 'float32',
     'low': 'float32', 'close': 'float32', 'volume': 'float32'
 })
-df['date'] = pd.to_datetime(df['date'])
+# Conversão robusta de datetime
+df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
+df = df.dropna(subset=['date'])
 
 ################################### SANITY CHECK - PREÇOS (OTIMIZADO) ###################################
 # Calcular limites apenas uma vez
@@ -458,9 +463,9 @@ for exchange_symbol, trade_size in trades_exchange.items():
     if fin_value < 5:
         # Ignorar trades muito pequenos
         continue
-    elif fin_value < 11:
+    elif fin_value < 10:
         # Ajustar para valor mínimo
-        min_size = 11 / price
+        min_size = 10 / price
         adjusted_trades[exchange_symbol] = min_size * (1 if trade_size > 0 else -1)
     else:
         # Manter trade original
