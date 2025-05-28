@@ -217,81 +217,49 @@ log_memory_usage("após forecasts")
 
 ################################ CALCULAR POSIÇÕES ÓTIMAS (OTIMIZADO) #####################################
 account_info = exchange.fetch_balance()
+
 capital = account_info.get('USDC', {}).get('total', None)
 if capital is None:
     time.sleep(20)
-    account_info = exchange.fetch_balance()
+    account_info = exchange.fetch_balance()  # essa linha estava faltando
     capital = account_info.get('USDC', {}).get('total', None)
     if capital is None:
         raise ValueError("Erro ao obter o capital em USDC.")
 
+
+
 vol_target = 0.5
 
-# OTIMIZAÇÃO 7: Cálculos vetorizados para posições
 percent_vol = returns_15min.ewm(span=20*96).std() * np.sqrt(365*96)
-last_percent_vol = percent_vol.iloc[-1]
+
+last_percent_vol= percent_vol.iloc[-1]
+
 last_price = filtered_price.iloc[-1]
 
-# Posições ideais (cálculo vetorizado)
+# Posições ideais
 n_contracts = (capital * combined_forecast * idm * risk_weights * vol_target) / (10 * last_percent_vol * last_price)
-buffer_width = (0.1 * capital * idm * risk_weights * vol_target) / (last_percent_vol * last_price)
 
-upper_buffer = n_contracts + buffer_width
-lower_buffer = n_contracts - buffer_width
+buffer_width = (0.1 * capital * idm * risk_weights * vol_target) / (percent_vol * price)
+
+upper_buffer = round(n_contracts + buffer_width)
+
+lower_buffer = round(n_contracts - buffer_width)
+
 
 # Posições atuais
 actual_positions_dict = exchange.fetchPositions()
-actual_positions_raw = pd.Series({
-    map_exchange_to_clean_symbol(p['info']['symbol']): float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
-    for p in actual_positions_dict if float(p['info']['position']['szi']) != 0
-}, dtype='float32')
+
+actual_positions = pd.Series({
+    p['symbol']: float(p['info']['position']['szi']) * (1 if p['side'] == 'long' else -1)
+    for p in actual_positions_dict
+})
 
 
-# CORREÇÃO ROBUSTA: Mapear símbolos da exchange para formato do banco
-def map_exchange_to_clean_symbol(exchange_symbol):
-    """Converte símbolo da exchange para formato limpo do banco"""
-    return exchange_symbol.replace('/USDC:USDC', '').replace('/USD:USD', '').replace('/USDT:USDT', '').strip()
-
-def map_clean_to_exchange_symbol(clean_symbol):
-    """Converte símbolo limpo para formato da exchange (padrão USDC)"""
-    return f"{clean_symbol}/USDC:USDC"
-
-# Converter posições atuais para formato limpo
-actual_positions_clean = pd.Series(dtype='float32')
-for symbol_exchange, position in actual_positions_raw.items():
-    symbol_clean = map_exchange_to_clean_symbol(symbol_exchange)
-    actual_positions_clean[symbol_clean] = position
-
-# Debug: verificar alinhamento de símbolos
-n_contracts_symbols = set(n_contracts.index)
-actual_positions_symbols = set(actual_positions_clean.index)
-common_symbols = n_contracts_symbols.intersection(actual_positions_symbols)
-only_in_calc = n_contracts_symbols - actual_positions_symbols
-only_in_positions = actual_positions_symbols - n_contracts_symbols
-
-logging.info(f"Símbolos em comum: {len(common_symbols)}")
-logging.info(f"Apenas em cálculos: {only_in_calc}")
-logging.info(f"Apenas em posições: {only_in_positions}")
-
-# Trabalhar apenas com símbolos que estão no universo de trading ou que têm posições
-relevant_symbols = n_contracts_symbols.union(actual_positions_symbols)
-
-# Alinhar todos os dados para símbolos relevantes
-n_contracts_aligned = n_contracts.reindex(relevant_symbols, fill_value=0)
-actual_positions_aligned = actual_positions_clean.reindex(relevant_symbols, fill_value=0)
-upper_buffer_aligned = upper_buffer.reindex(relevant_symbols, fill_value=0)
-lower_buffer_aligned = lower_buffer.reindex(relevant_symbols, fill_value=0)
-
-# Posições ótimas (apenas rebalancear onde necessário)
-optimal_positions = n_contracts_aligned.where(
-    (actual_positions_aligned < lower_buffer_aligned) | (actual_positions_aligned > upper_buffer_aligned),
-    actual_positions_aligned
+# Posições ótimas
+optimal_positions = n_contracts.where(
+    (actual_positions < lower_buffer) | (actual_positions > upper_buffer),
+    actual_positions
 )
-
-# Zerar posições de símbolos que não fazem mais parte do universo de trading
-for symbol in only_in_positions:
-    if symbol not in n_contracts_symbols:
-        optimal_positions[symbol] = 0  # Forçar fechamento
 
 ####################################### RISK OVERLAY (OTIMIZADO) ####################################################
 # Leverage
@@ -333,98 +301,71 @@ logging.info(f"Posições ótimas:\n{optimal_positions.to_string()}")
 
 ################################ EXECUÇÃO DE ORDENS (OTIMIZADO) #####################################
 
-# Criar mapeamento reverso: clean_symbol -> exchange_symbol baseado nas posições atuais
-clean_to_exchange_map = {}
-for exchange_symbol in actual_positions_raw.index:
-    clean_symbol = map_exchange_to_clean_symbol(exchange_symbol)
-    clean_to_exchange_map[clean_symbol] = exchange_symbol
+# 1. Identifica ativos a zerar (presentes apenas em actual_positions)
 
-# Para símbolos novos (não em posições atuais), usar o formato padrão
-for clean_symbol in optimal_positions.index:
-    if clean_symbol not in clean_to_exchange_map:
-        clean_to_exchange_map[clean_symbol] = map_clean_to_exchange_symbol(clean_symbol)
+optimal_positions.index = optimal_positions.index.map(lambda x: f"{x}/USDC:USDC")
 
-# Converter optimal_positions para formato da exchange
-optimal_positions_exchange = pd.Series(dtype='float32')
-for clean_symbol, position in optimal_positions.items():
-    exchange_symbol = clean_to_exchange_map.get(clean_symbol, map_clean_to_exchange_symbol(clean_symbol))
-    optimal_positions_exchange[exchange_symbol] = position
 
-# Identificar símbolos para fechar (estão em posições atuais mas não em optimal)
-symbols_to_close = set(actual_positions_raw.index) - set(optimal_positions_exchange.index)
+symbols_to_close = actual_positions.index.difference(optimal_positions.index)
 
-# Gerar ordens de fechamento
+# 2. Gera ordens de zeragem (reduceOnly = True)
 orders = []
 for symbol in symbols_to_close:
-    amount = actual_positions_raw[symbol]
-    if abs(amount) < 1e-6:  # Ignorar posições muito pequenas
+    amount = actual_positions[symbol]
+    if amount == 0:
         continue
-    
+
     orders.append({
         "symbol": symbol,
         "type": "market",
         "side": "sell" if amount > 0 else "buy",
         "amount": abs(amount),
-        "params": {"reduceOnly": True}
+        "params": {
+            "reduceOnly": True
+        }
     })
 
-logging.info(f"Ordens de fechamento: {len(orders)} para símbolos {list(symbols_to_close)}")
+# 3. Remove esses ativos antes de calcular os trades restantes
+actual_positions = actual_positions.drop(symbols_to_close)
 
-# Calcular trades para símbolos relevantes
-trades_exchange = pd.Series(dtype='float32')
-for exchange_symbol, optimal_pos in optimal_positions_exchange.items():
-    current_pos = actual_positions_raw.get(exchange_symbol, 0)
-    trade_size = optimal_pos - current_pos
-    
-    if abs(trade_size) > 1e-6:  # Apenas trades significativos
-        trades_exchange[exchange_symbol] = trade_size
+# 4. Garante alinhamento dos índices
+all_symbols = optimal_positions.index.union(actual_positions.index)
+optimal_positions = optimal_positions.reindex(all_symbols, fill_value=0)
+actual_positions = actual_positions.reindex(all_symbols, fill_value=0)
 
-# Filtrar trades por valor mínimo
-trades_financial_value = pd.Series(dtype='float32')
-for exchange_symbol, trade_size in trades_exchange.items():
-    clean_symbol = map_exchange_to_clean_symbol(exchange_symbol)
-    price = last_price.get(clean_symbol, 1)  # Default price se não encontrar
-    fin_value = abs(trade_size * price)
-    trades_financial_value[exchange_symbol] = fin_value
+# 5. Calcula os trades
+trades = optimal_positions - actual_positions
 
-# Ajustar trades baseado no valor financeiro
-adjusted_trades = pd.Series(dtype='float32')
-for exchange_symbol, trade_size in trades_exchange.items():
-    fin_value = trades_financial_value[exchange_symbol]
-    clean_symbol = map_exchange_to_clean_symbol(exchange_symbol)
-    price = last_price.get(clean_symbol, 1)
-    
-    if fin_value < 5:
-        # Ignorar trades muito pequenos
+# 6. Calcula o valor financeiro por trade
+fin_amount = (trades * price).abs()
+
+# 7. Ajusta para respeitar o mínimo financeiro (ordens < $5 são ignoradas, $5–$10 são arredondadas)
+adjusted_trades = trades.where(~((fin_amount > 0) & (fin_amount < 5)), 0)
+
+# Substitui onde o valor financeiro está entre 5 e 10 (exclusive) por uma ordem mínima viável
+min_amount = (10 / price).where(trades != 0, 0) * np.sign(trades)
+adjusted_trades = adjusted_trades.where(~((fin_amount >= 5) & (fin_amount < 10)), min_amount)
+
+# 8. Monta ordens normais (market)
+for symbol, amount in adjusted_trades.items():
+    if amount == 0 or pd.isna(amount):
         continue
-    elif fin_value < 10:
-        # Ajustar para valor mínimo
-        min_size = 11 / price
-        adjusted_trades[exchange_symbol] = min_size * (1 if trade_size > 0 else -1)
-    else:
-        # Manter trade original
-        adjusted_trades[exchange_symbol] = trade_size
 
-# Gerar ordens normais
-for exchange_symbol, amount in adjusted_trades.items():
-    if abs(amount) < 1e-6:  # Ignorar valores muito pequenos
-        continue
-    
     orders.append({
-        "symbol": exchange_symbol,  # Já está no formato correto da exchange
+        "symbol": symbol,
         "type": "market",
         "side": "buy" if amount > 0 else "sell",
         "amount": abs(amount),
     })
 
-logging.info(f"Total de ordens: {len(orders)} (fechamento + novas posições)")
 
-# Executar ordens
-execute_orders = exchange.createOrders(orders) if orders else []
+execute_orders = exchange.createOrders(orders)
+
 
 time.sleep(20)
 
-# Verificação de execução
+
+# Função para verificar se a ordem foi totalmente executada
 def was_filled(order):
     try:
         filled_sz = float(order['info']['filled']['totalSz'])
@@ -433,34 +374,30 @@ def was_filled(order):
     except (KeyError, TypeError, ValueError):
         return False
 
-# Relatório de execução
-if execute_orders:
-    partial_fills = [o for o in execute_orders if not was_filled(o)]
-    
-    if partial_fills:
-        logging.warning("Ordens não totalmente executadas:")
-        for o in partial_fills:
-            symbol = o.get('symbol', 'UNKNOWN')
-            amount = o.get('amount', '?')
-            filled = o.get('info', {}).get('filled', {}).get('totalSz', '?')
-            logging.warning(f"{symbol}: solicitado={amount} | executado={filled}")
-    else:
-        logging.info(f"Ordens executadas com sucesso: {len(execute_orders)}")
+# Filtra ordens parcialmente executadas
+partial_fills = [o for o in execute_orders if not was_filled(o)]
 
-# Salvar resultados
+# Reporta
+if partial_fills:
+    logging.warning("Ordens não totalmente executadas:")
+    for o in partial_fills:
+        symbol = o.get('symbol', 'UNKNOWN')
+        amount = o.get('amount', '?')
+        filled = o.get('info', {}).get('filled', {}).get('totalSz', '?')
+        logging.warning(f"{symbol}: solicitado={amount} | executado={filled}")
+
+else:
+    logging.info(f"Ordens executadas com sucesso: {len(execute_orders)}")
+
+
 updated_positions = exchange.fetchPositions()
 
-if execute_orders:
-    execute_orders_df = pd.DataFrame(execute_orders)
-    execute_orders_df.to_sql('orders', con=engine, index=False, if_exists='append')
 
-if updated_positions:
-    updated_positions_df = pd.DataFrame(updated_positions)
-    updated_positions_df.to_sql('positions', con=engine, index=False, if_exists='append')
+execute_orders_df = pd.DataFrame(execute_orders)
+execute_orders_df.to_sql('orders', con=database, index=False, if_exists='append')
 
-# Limpeza final
-gc.collect()
-log_memory_usage("final")
+updated_positions_df = pd.DataFrame(updated_positions)
+updated_positions_df.to_sql('positions', con=database, index=False, if_exists='append')
 
 logging.info("Execução completa com sucesso.")
 logging.info(f"Tempo total de execução: {round(time.time() - start_time, 2)} segundos.")
