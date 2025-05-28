@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine
 import os
-import pysass_crypto_otimizado as sass_crypto  # Usar versão otimizada
+import pysass_crypto as sass_crypto
 import logging
 import gc
 import psutil  # Para monitorar memória
